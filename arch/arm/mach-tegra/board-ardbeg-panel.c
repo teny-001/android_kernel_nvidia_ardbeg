@@ -538,6 +538,9 @@ static struct tegra_dc_platform_data ardbeg_disp2_pdata = {
 	.default_out	= &ardbeg_disp2_out,
 	.fb		= &ardbeg_disp2_fb_data,
 	.emc_clk_rate	= 300000000,
+#ifdef CONFIG_TEGRA_DC_CMU
+	.cmu_enable	= 1,
+#endif
 };
 
 static struct platform_device ardbeg_disp2_device = {
@@ -572,18 +575,21 @@ static struct nvmap_platform_carveout ardbeg_carveouts[] = {
 		.usage_mask	= NVMAP_HEAP_CARVEOUT_IRAM,
 		.base		= TEGRA_IRAM_BASE + TEGRA_RESET_HANDLER_SIZE,
 		.size		= TEGRA_IRAM_SIZE - TEGRA_RESET_HANDLER_SIZE,
+		.dma_dev	= &tegra_iram_dev,
 	},
 	[1] = {
 		.name		= "generic-0",
 		.usage_mask	= NVMAP_HEAP_CARVEOUT_GENERIC,
 		.base		= 0, /* Filled in by ardbeg_panel_init() */
 		.size		= 0, /* Filled in by ardbeg_panel_init() */
+		.dma_dev	= &tegra_generic_dev,
 	},
 	[2] = {
 		.name		= "vpr",
 		.usage_mask	= NVMAP_HEAP_CARVEOUT_VPR,
 		.base		= 0, /* Filled in by ardbeg_panel_init() */
 		.size		= 0, /* Filled in by ardbeg_panel_init() */
+		.dma_dev	= &tegra_vpr_dev,
 	},
 };
 
@@ -598,15 +604,15 @@ static struct platform_device ardbeg_nvmap_device  = {
 		.platform_data = &ardbeg_nvmap_data,
 	},
 };
-static struct tegra_io_dpd dsic_io = {
-	.name			= "DSIC",
-	.io_dpd_reg_index	= 1,
-	.io_dpd_bit		= 8,
+static struct tegra_io_dpd __maybe_unused dsic_io = {
+    .name           = "DSIC",
+    .io_dpd_reg_index   = 1,
+    .io_dpd_bit     = 8,
 };
-static struct tegra_io_dpd dsid_io = {
-	.name			= "DSID",
-	.io_dpd_reg_index	= 1,
-	.io_dpd_bit		= 9,
+static struct tegra_io_dpd __maybe_unused dsid_io = {
+    .name           = "DSID",
+    .io_dpd_reg_index   = 1,
+    .io_dpd_bit     = 9,
 };
 
 static struct tegra_dc_dp_lt_settings ardbeg_edp_lt_data[] = {
@@ -678,7 +684,7 @@ static struct tegra_dc_dp_lt_settings ardbeg_edp_lt_data[] = {
 	},
 };
 
-static struct tegra_dp_out dp_settings = {
+static struct tegra_dp_out __maybe_unused dp_settings = {
 	/* Panel can override this with its own LT data */
 	.lt_settings = ardbeg_edp_lt_data,
 	.n_lt_settings = ARRAY_SIZE(ardbeg_edp_lt_data),
@@ -850,7 +856,7 @@ int __init ardbeg_panel_init(void)
 
 	struct device_node *dc1_node = NULL;
 	struct device_node *dc2_node = NULL;
-#ifdef CONFIG_TEGRA_NVMAP
+#ifdef CONFIG_NVMAP_USE_CMA_FOR_CARVEOUT
 	struct dma_declare_info vpr_dma_info;
 	struct dma_declare_info generic_dma_info;
 #endif
@@ -864,8 +870,11 @@ int __init ardbeg_panel_init(void)
 #ifdef CONFIG_TEGRA_NVMAP
 	ardbeg_carveouts[1].base = tegra_carveout_start;
 	ardbeg_carveouts[1].size = tegra_carveout_size;
+
 	ardbeg_carveouts[2].base = tegra_vpr_start;
 	ardbeg_carveouts[2].size = tegra_vpr_size;
+
+#ifdef CONFIG_NVMAP_USE_CMA_FOR_CARVEOUT
 	generic_dma_info.name = "generic";
 	generic_dma_info.base = tegra_carveout_start;
 	generic_dma_info.size = tegra_carveout_size;
@@ -877,20 +886,15 @@ int __init ardbeg_panel_init(void)
 	vpr_dma_info.size = tegra_vpr_size;
 	vpr_dma_info.resize = false;
 	vpr_dma_info.cma_dev = NULL;
-#ifdef CONFIG_NVMAP_USE_CMA_FOR_CARVEOUT
-	carveout_linear_set(&tegra_generic_cma_dev);
 	ardbeg_carveouts[1].cma_dev = &tegra_generic_cma_dev;
 	ardbeg_carveouts[1].resize = false;
-	carveout_linear_set(&tegra_vpr_cma_dev);
 	ardbeg_carveouts[2].cma_dev = &tegra_vpr_cma_dev;
 	ardbeg_carveouts[2].resize = true;
-	ardbeg_carveouts[2].cma_chunk_size = SZ_32M;
 
 	vpr_dma_info.size = SZ_32M;
 	vpr_dma_info.resize = true;
 	vpr_dma_info.cma_dev = &tegra_vpr_cma_dev;
 	vpr_dma_info.notifier.ops = &vpr_dev_ops;
-#endif
 
 	if (tegra_carveout_size) {
 		err = dma_declare_coherent_resizable_cma_memory(
@@ -908,6 +912,7 @@ int __init ardbeg_panel_init(void)
 			return err;
 		}
 	}
+#endif
 
 	err = platform_device_register(&ardbeg_nvmap_device);
 	if (err) {
@@ -1003,12 +1008,12 @@ int __init ardbeg_panel_init(void)
 
 int __init ardbeg_display_init(void)
 {
-	struct clk *disp1_clk = clk_get_sys("tegradc.0", NULL);
-	struct clk *disp2_clk = clk_get_sys("tegradc.1", NULL);
-	struct tegra_panel *panel;
-	struct board_info board;
-	long disp1_rate = 0;
-	long disp2_rate = 0;
+    struct clk *disp1_clk = clk_get_sys("tegradc.0", NULL);
+    struct clk *disp2_clk = clk_get_sys("tegradc.1", NULL);
+    struct tegra_panel *panel __maybe_unused;
+    struct board_info board __maybe_unused;
+    long disp1_rate __maybe_unused = 0;
+    long disp2_rate = 0;
 
 	/*
 	 * TODO

@@ -32,6 +32,7 @@
 #include <linux/random.h>
 #include <linux/elf.h>
 #include <linux/utsname.h>
+#include <asm/auxvec.h>
 #include <linux/coredump.h>
 #include <linux/sched.h>
 #include <asm/uaccess.h>
