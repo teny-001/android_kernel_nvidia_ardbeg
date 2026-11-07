@@ -1,7 +1,7 @@
 /*
  * GK20A Graphics Engine
  *
- * Copyright (c) 2011-2014, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2011-2016, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -15,15 +15,20 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-#ifndef __GR_GK20A_H__
-#define __GR_GK20A_H__
+#ifndef GR_GK20A_H
+#define GR_GK20A_H
 
 #include <linux/slab.h>
+#ifdef CONFIG_ARCH_TEGRA_18x_SOC
+#include "gr_t18x.h"
+#endif
 
+#include "tsg_gk20a.h"
 #include "gr_ctx_gk20a.h"
 
-#define GR_IDLE_CHECK_DEFAULT		100 /* usec */
-#define GR_IDLE_CHECK_MAX		5000 /* usec */
+#define GR_IDLE_CHECK_DEFAULT		10 /* usec */
+#define GR_IDLE_CHECK_MAX		200 /* usec */
+#define GR_FECS_POLL_INTERVAL		5 /* usec */
 
 #define INVALID_SCREEN_TILE_ROW_OFFSET	0xFFFFFFFF
 #define INVALID_MAX_WAYS		0xFFFFFFFF
@@ -92,6 +97,7 @@ enum {
 struct gr_channel_map_tlb_entry {
 	u32 curr_ctx;
 	u32 hw_chid;
+	u32 tsgid;
 };
 
 struct gr_zcull_gk20a {
@@ -159,6 +165,16 @@ struct zbc_query_params {
 	u32 index_size;	/* [out] size, [in] index */
 };
 
+struct sm_info {
+	u8 gpc_index;
+	u8 tpc_index;
+};
+
+#if defined(CONFIG_GK20A_CYCLE_STATS)
+struct gk20a_cs_snapshot_client;
+struct gk20a_cs_snapshot;
+#endif
+
 struct gr_gk20a {
 	struct gk20a *g;
 	struct {
@@ -209,6 +225,11 @@ struct gr_gk20a {
 
 	u32 num_fbps;
 
+	u32 comptags_per_cacheline;
+	u32 slices_per_ltc;
+	u32 cacheline_size;
+	u32 gobs_per_comptagline_per_slice;
+
 	u32 max_gpc_count;
 	u32 max_fbps_count;
 	u32 max_tpc_per_gpc_count;
@@ -222,6 +243,7 @@ struct gr_gk20a {
 	u32 *gpc_ppc_count;
 	u32 tpc_count;
 	u32 *gpc_tpc_count;
+	u32 *gpc_tpc_mask;
 	u32 zcb_count;
 	u32 *gpc_zcb_count;
 	u32 *pes_tpc_count[2];
@@ -239,21 +261,22 @@ struct gr_gk20a {
 
 	struct gr_ctx_buffer_desc global_ctx_buffer[NR_GLOBAL_CTX_BUF];
 
-	struct mmu_desc mmu_wr_mem;
-	u32 mmu_wr_mem_size;
-	struct mmu_desc mmu_rd_mem;
-	u32 mmu_rd_mem_size;
+	struct mem_desc mmu_wr_mem;
+	struct mem_desc mmu_rd_mem;
 
 	u8 *map_tiles;
 	u32 map_tile_count;
 	u32 map_row_offset;
 
-#define COMP_TAG_LINE_SIZE_SHIFT	(17)	/* one tag covers 128K */
-#define COMP_TAG_LINE_SIZE		(1 << COMP_TAG_LINE_SIZE_SHIFT)
-
 	u32 max_comptag_mem; /* max memory size (MB) for comptag */
 	struct compbit_store_desc compbit_store;
-	struct gk20a_allocator comp_tags;
+	struct gk20a_comptag_allocator {
+		struct mutex lock;
+		/* this bitmap starts at ctag 1. 0th cannot be taken */
+		unsigned long *bitmap;
+		/* size of bitmap, not max ctags, so one less */
+		unsigned long size;
+	} comp_tags;
 
 	struct gr_zcull_gk20a zcull;
 
@@ -267,8 +290,6 @@ struct gr_gk20a {
 	s32 max_used_color_index;
 	s32 max_used_depth_index;
 
-	u32 status_disable_mask;
-
 #define GR_CHANNEL_MAP_TLB_SIZE		2 /* must of power of 2 */
 	struct gr_channel_map_tlb_entry chid_tlb[GR_CHANNEL_MAP_TLB_SIZE];
 	u32 channel_tlb_flush_index;
@@ -277,6 +298,17 @@ struct gr_gk20a {
 	void (*remove_support)(struct gr_gk20a *gr);
 	bool sw_ready;
 	bool skip_ucode_init;
+
+#ifdef CONFIG_ARCH_TEGRA_18x_SOC
+	struct gr_t18x t18x;
+#endif
+	u32 fbp_en_mask;
+	u32 no_of_sm;
+	struct sm_info *sm_to_cluster;
+#if defined(CONFIG_GK20A_CYCLE_STATS)
+	struct mutex			cs_lock;
+	struct gk20a_cs_snapshot	*cs_data;
+#endif
 };
 
 void gk20a_fecs_dump_falcon_stats(struct gk20a *g);
@@ -289,16 +321,35 @@ struct gk20a_ctxsw_ucode_segment {
 struct gk20a_ctxsw_ucode_segments {
 	u32 boot_entry;
 	u32 boot_imem_offset;
+	u32 boot_signature;
 	struct gk20a_ctxsw_ucode_segment boot;
 	struct gk20a_ctxsw_ucode_segment code;
 	struct gk20a_ctxsw_ucode_segment data;
 };
 
+/* sums over the ucode files as sequences of u32, computed to the
+ * boot_signature field in the structure above */
+
+#define FALCON_UCODE_SIG_T21X_FECS_WITH_DMEM_SIZE	0x9121ab5c
+#define FALCON_UCODE_SIG_T21X_FECS_WITH_RESERVED	0x9125ab5c
+#define FALCON_UCODE_SIG_T12X_FECS_WITH_RESERVED	0x8a621f78
+#define FALCON_UCODE_SIG_T12X_FECS_WITHOUT_RESERVED	0x67e5344b
+#define FALCON_UCODE_SIG_T12X_FECS_OLDER		0x56da09f
+
+#define FALCON_UCODE_SIG_T21X_GPCCS_WITH_RESERVED	0x3d3d65e2
+#define FALCON_UCODE_SIG_T12X_GPCCS_WITH_RESERVED	0x303465d5
+#define FALCON_UCODE_SIG_T12X_GPCCS_WITHOUT_RESERVED	0x3fdd33d3
+#define FALCON_UCODE_SIG_T12X_GPCCS_OLDER		0x53d7877
+
+#define FALCON_UCODE_SIG_T21X_FECS_WITHOUT_RESERVED	0x93671b7d
+#define FALCON_UCODE_SIG_T21X_FECS_WITHOUT_RESERVED2	0x4d6cbc10
+
+#define FALCON_UCODE_SIG_T21X_GPCCS_WITHOUT_RESERVED	0x393161da
+
 struct gk20a_ctxsw_ucode_info {
 	u64 *p_va;
-	struct inst_desc inst_blk_desc;
-	struct surface_mem_desc surface_desc;
-	u64 ucode_gpuva;
+	struct mem_desc inst_blk_desc;
+	struct mem_desc surface_desc;
 	struct gk20a_ctxsw_ucode_segments fecs;
 	struct gk20a_ctxsw_ucode_segments gpccs;
 };
@@ -310,24 +361,53 @@ struct gk20a_ctxsw_bootloader_desc {
 	u32 entry_point;
 };
 
+struct fecs_method_op_gk20a {
+	struct {
+		u32 addr;
+		u32 data;
+	} method;
+
+	struct {
+		u32 id;
+		u32 data;
+		u32 clr;
+		u32 *ret;
+		u32 ok;
+		u32 fail;
+	} mailbox;
+
+	struct {
+		u32 ok;
+		u32 fail;
+	} cond;
+
+};
+
 struct gpu_ops;
+int gr_gk20a_load_golden_ctx_image(struct gk20a *g,
+					struct channel_gk20a *c);
 void gk20a_init_gr(struct gk20a *g);
 void gk20a_init_gr_ops(struct gpu_ops *gops);
 int gk20a_init_gr_support(struct gk20a *g);
+int gk20a_enable_gr_hw(struct gk20a *g);
 int gk20a_gr_reset(struct gk20a *g);
 void gk20a_gr_wait_initialized(struct gk20a *g);
+/* real size here, but first (ctag 0) isn't used */
+int gk20a_comptag_allocator_init(struct gk20a_comptag_allocator *allocator,
+		unsigned long size);
+void gk20a_comptag_allocator_destroy(struct gk20a_comptag_allocator *allocator);
 
 int gk20a_init_gr_channel(struct channel_gk20a *ch_gk20a);
 
 int gr_gk20a_init_ctx_vars(struct gk20a *g, struct gr_gk20a *gr);
 
-struct nvhost_alloc_obj_ctx_args;
-struct nvhost_free_obj_ctx_args;
+struct nvgpu_alloc_obj_ctx_args;
+struct nvgpu_free_obj_ctx_args;
 
 int gk20a_alloc_obj_ctx(struct channel_gk20a *c,
-			struct nvhost_alloc_obj_ctx_args *args);
+			struct nvgpu_alloc_obj_ctx_args *args);
 int gk20a_free_obj_ctx(struct channel_gk20a *c,
-			struct nvhost_free_obj_ctx_args *args);
+			struct nvgpu_free_obj_ctx_args *args);
 void gk20a_free_channel_ctx(struct channel_gk20a *c);
 
 int gk20a_gr_isr(struct gk20a *g);
@@ -364,20 +444,24 @@ bool gk20a_gr_sm_debugger_attached(struct gk20a *g);
 #define gr_gk20a_elpg_protected_call(g, func) \
 	({ \
 		int err = 0; \
-		if (support_gk20a_pmu()) \
+		if (support_gk20a_pmu(g->dev) && g->elpg_enabled) { \
 			err = gk20a_pmu_disable_elpg(g); \
-		if (err) return err; \
+			if (err) { \
+				gk20a_pmu_enable_elpg(g); \
+				return err; \
+			} \
+		} \
 		err = func; \
-		if (support_gk20a_pmu()) \
+		if (support_gk20a_pmu(g->dev) && g->elpg_enabled) \
 			gk20a_pmu_enable_elpg(g); \
 		err; \
 	})
 
 int gk20a_gr_suspend(struct gk20a *g);
 
-struct nvhost_dbg_gpu_reg_op;
+struct nvgpu_dbg_gpu_reg_op;
 int gr_gk20a_exec_ctx_ops(struct channel_gk20a *ch,
-			  struct nvhost_dbg_gpu_reg_op *ctx_ops, u32 num_ops,
+			  struct nvgpu_dbg_gpu_reg_op *ctx_ops, u32 num_ops,
 			  u32 num_ctx_wr_ops, u32 num_ctx_rd_ops);
 int gr_gk20a_get_ctx_buffer_offsets(struct gk20a *g,
 				    u32 addr,
@@ -401,13 +485,63 @@ void gr_gk20a_commit_global_pagepool(struct gk20a *g,
 				     u64 addr, u32 size, bool patch);
 void gk20a_gr_set_shader_exceptions(struct gk20a *g, u32 data);
 void gr_gk20a_enable_hww_exceptions(struct gk20a *g);
-void gr_gk20a_get_sm_dsm_perf_regs(struct gk20a *g,
-				   u32 *num_sm_dsm_perf_regs,
-				   u32 **sm_dsm_perf_regs,
-				   u32 *perf_register_stride);
-void gr_gk20a_get_sm_dsm_perf_ctrl_regs(struct gk20a *g,
-					u32 *num_sm_dsm_perf_regs,
-					u32 **sm_dsm_perf_regs,
-					u32 *perf_register_stride);
 int gr_gk20a_setup_rop_mapping(struct gk20a *g, struct gr_gk20a *gr);
+int gr_gk20a_init_ctxsw_ucode(struct gk20a *g);
+int gr_gk20a_load_ctxsw_ucode(struct gk20a *g);
+void gr_gk20a_load_falcon_bind_instblk(struct gk20a *g);
+void gr_gk20a_load_ctxsw_ucode_header(struct gk20a *g, u64 addr_base,
+	struct gk20a_ctxsw_ucode_segments *segments, u32 reg_offset);
+void gr_gk20a_load_ctxsw_ucode_boot(struct gk20a *g, u64 addr_base,
+	struct gk20a_ctxsw_ucode_segments *segments, u32 reg_offset);
+
+
+void gr_gk20a_free_tsg_gr_ctx(struct tsg_gk20a *c);
+int gr_gk20a_disable_ctxsw(struct gk20a *g);
+int gr_gk20a_enable_ctxsw(struct gk20a *g);
+void gk20a_resume_all_sms(struct gk20a *g);
+void gk20a_suspend_all_sms(struct gk20a *g);
+int gk20a_gr_lock_down_sm(struct gk20a *g,
+				 u32 gpc, u32 tpc, u32 global_esr_mask);
+bool gk20a_is_channel_ctx_resident(struct channel_gk20a *ch);
+int gr_gk20a_add_zbc_color(struct gk20a *g, struct gr_gk20a *gr,
+			   struct zbc_entry *color_val, u32 index);
+int gr_gk20a_add_zbc_depth(struct gk20a *g, struct gr_gk20a *gr,
+			   struct zbc_entry *depth_val, u32 index);
+int gr_gk20a_wait_idle(struct gk20a *g, unsigned long end_jiffies,
+		       u32 expect_delay);
+int gr_gk20a_init_ctx_state(struct gk20a *g);
+int gr_gk20a_submit_fecs_method_op(struct gk20a *g,
+				   struct fecs_method_op_gk20a op,
+				   bool sleepduringwait);
+int gr_gk20a_alloc_gr_ctx(struct gk20a *g,
+			  struct gr_ctx_desc **__gr_ctx, struct vm_gk20a *vm,
+			  u32 class, u32 padding);
+void gr_gk20a_free_gr_ctx(struct gk20a *g,
+			  struct vm_gk20a *vm, struct gr_ctx_desc *gr_ctx);
+int gr_gk20a_halt_pipe(struct gk20a *g);
+int gr_gk20a_debugfs_init(struct gk20a *g);
+
+#if defined(CONFIG_GK20A_CYCLE_STATS)
+int gr_gk20a_css_attach(struct gk20a *g,	/* in - main hw structure */
+			u32 dmabuf_fd,		/* in - dma mapped memory */
+			u32 perfmon_id_count,	/* in - number of perfmons*/
+			u32 *perfmon_id_start,	/* out- index of first pm */
+			/* out - pointer to client data used in later     */
+			struct gk20a_cs_snapshot_client **css_client);
+
+int gr_gk20a_css_detach(struct gk20a *g,
+				struct gk20a_cs_snapshot_client *css_client);
+int gr_gk20a_css_flush(struct gk20a *g,
+				struct gk20a_cs_snapshot_client *css_client);
+
+void gr_gk20a_free_cyclestats_snapshot_data(struct gk20a *g);
+
+#else
+/* fake empty cleanup function if no cyclestats snapshots enabled */
+static inline void gr_gk20a_free_cyclestats_snapshot_data(struct gk20a *g)
+{
+	(void)g;
+}
+#endif
+
 #endif /*__GR_GK20A_H__*/

@@ -374,9 +374,11 @@ void prep_compound_page(struct page *page, unsigned long order)
 	__SetPageHead(page);
 	for (i = 1; i < nr_pages; i++) {
 		struct page *p = page + i;
-		__SetPageTail(p);
 		set_page_count(p, 0);
 		p->first_page = page;
+		/* Make sure p->first_page is always valid for PageTail() */
+		smp_wmb();
+		__SetPageTail(p);
 	}
 }
 
@@ -1036,16 +1038,29 @@ __rmqueue_fallback(struct zone *zone, int order, int start_migratetype)
 	int current_order;
 	struct page *page;
 	int migratetype, i;
+	int non_cma_order;
 
 	/* Find the largest possible block of pages in the other list */
-	for (current_order = MAX_ORDER-1; current_order >= order;
-						--current_order) {
+	for (non_cma_order = MAX_ORDER-1; non_cma_order >= order;
+						--non_cma_order) {
 		for (i = 0;; i++) {
 			migratetype = fallbacks[start_migratetype][i];
 
 			/* MIGRATE_RESERVE handled later if necessary */
 			if (migratetype == MIGRATE_RESERVE)
 				break;
+
+			if (is_migrate_cma(migratetype))
+				/* CMA page blocks are not movable across
+				 * migrate types. Seach for free blocks
+				 * from lowest order to avoid contiguous
+				 * higher alignment allocations for subsequent
+				 * alloc requests.
+				 */
+				current_order = order + MAX_ORDER - 1 -
+						non_cma_order;
+			else
+				current_order = non_cma_order;
 
 			area = &(zone->free_area[current_order]);
 			if (list_empty(&area->free_list[migratetype]))
@@ -1109,6 +1124,10 @@ __rmqueue_fallback(struct zone *zone, int order, int start_migratetype)
 	return NULL;
 }
 
+#ifdef CONFIG_CMA
+unsigned long cma_get_total_pages(void);
+#endif
+
 /*
  * Do the hard work of removing an element from the buddy allocator.
  * Call me with the zone->lock already held.
@@ -1116,10 +1135,24 @@ __rmqueue_fallback(struct zone *zone, int order, int start_migratetype)
 static struct page *__rmqueue(struct zone *zone, unsigned int order,
 						int migratetype)
 {
-	struct page *page;
+	struct page *page = NULL;
 
 retry_reserve:
-	page = __rmqueue_smallest(zone, order, migratetype);
+#ifdef CONFIG_CMA
+	if (migratetype == MIGRATE_MOVABLE) {
+
+		unsigned long nr_cma_pages = cma_get_total_pages();
+		unsigned long nr_free_cma_pages =
+			global_page_state(NR_FREE_CMA_PAGES);
+		unsigned int current_cma_usage = 100 -
+			((nr_free_cma_pages * 100) / nr_cma_pages);
+
+		if (current_cma_usage < cma_threshold_get())
+			page = __rmqueue_smallest(zone, order, MIGRATE_CMA);
+	}
+	if (!page)
+#endif
+		page = __rmqueue_smallest(zone, order, migratetype);
 
 	if (unlikely(!page) && migratetype != MIGRATE_RESERVE) {
 		page = __rmqueue_fallback(zone, order, migratetype);
@@ -2139,6 +2172,14 @@ __alloc_pages_may_oom(gfp_t gfp_mask, unsigned int order,
 	}
 
 	/*
+	 * PM-freezer should be notified that there might be an OOM killer on
+	 * its way to kill and wake somebody up. This is too early and we might
+	 * end up not killing anything but false positives are acceptable.
+	 * See freeze_processes.
+	 */
+	note_oom_kill();
+
+	/*
 	 * Go through the zonelist yet one more time, keep very high watermark
 	 * here, this is only to catch a parallel oom killing, we must fail if
 	 * we're still under heavy pressure.
@@ -2350,6 +2391,13 @@ void wake_all_kswapd(unsigned int order, struct zonelist *zonelist,
 	struct zoneref *z;
 	struct zone *zone;
 
+	/* Have this condition only on tegra and when ZRAM is disabled. */
+	if (config_enabled(CONFIG_ARCH_TEGRA) && !total_swap_pages)
+		/* Avoid kswapd for all higher zones */
+		for_each_zone_zonelist(zone, z, zonelist, high_zoneidx)
+			if (high_zoneidx > zone_idx(zone) + 1)
+				high_zoneidx = zone_idx(zone) + 1;
+
 	for_each_zone_zonelist(zone, z, zonelist, high_zoneidx)
 		wakeup_kswapd(zone, order, classzone_idx);
 }
@@ -2358,7 +2406,7 @@ static inline int
 gfp_to_alloc_flags(gfp_t gfp_mask)
 {
 	int alloc_flags = ALLOC_WMARK_MIN | ALLOC_CPUSET;
-	const gfp_t wait = gfp_mask & __GFP_WAIT;
+	const bool atomic = !(gfp_mask & (__GFP_WAIT | __GFP_NO_KSWAPD));
 
 	/* __GFP_HIGH is assumed to be the same as ALLOC_HIGH to save a branch. */
 	BUILD_BUG_ON(__GFP_HIGH != (__force gfp_t) ALLOC_HIGH);
@@ -2367,20 +2415,20 @@ gfp_to_alloc_flags(gfp_t gfp_mask)
 	 * The caller may dip into page reserves a bit more if the caller
 	 * cannot run direct reclaim, or if the caller has realtime scheduling
 	 * policy or is asking for __GFP_HIGH memory.  GFP_ATOMIC requests will
-	 * set both ALLOC_HARDER (!wait) and ALLOC_HIGH (__GFP_HIGH).
+	 * set both ALLOC_HARDER (atomic == true) and ALLOC_HIGH (__GFP_HIGH).
 	 */
 	alloc_flags |= (__force int) (gfp_mask & __GFP_HIGH);
 
-	if (!wait) {
+	if (atomic) {
 		/*
-		 * Not worth trying to allocate harder for
-		 * __GFP_NOMEMALLOC even if it can't schedule.
+		 * Not worth trying to allocate harder for __GFP_NOMEMALLOC even
+		 * if it can't schedule.
 		 */
-		if  (!(gfp_mask & __GFP_NOMEMALLOC))
+		if (!(gfp_mask & __GFP_NOMEMALLOC))
 			alloc_flags |= ALLOC_HARDER;
 		/*
-		 * Ignore cpuset if GFP_ATOMIC (!wait) rather than fail alloc.
-		 * See also cpuset_zone_allowed() comment in kernel/cpuset.c.
+		 * Ignore cpuset mems for GFP_ATOMIC rather than fail, see the
+		 * comment for __cpuset_node_allowed_softwall().
 		 */
 		alloc_flags &= ~ALLOC_CPUSET;
 	} else if (unlikely(rt_task(current)) && !in_interrupt())
@@ -4548,7 +4596,7 @@ static inline void setup_usemap(struct pglist_data *pgdat, struct zone *zone,
 #ifdef CONFIG_HUGETLB_PAGE_SIZE_VARIABLE
 
 /* Initialise the number of pages represented by NR_PAGEBLOCK_BITS */
-void __init set_pageblock_order(void)
+void __paginginit set_pageblock_order(void)
 {
 	unsigned int order;
 
@@ -4576,7 +4624,7 @@ void __init set_pageblock_order(void)
  * include/linux/pageblock-flags.h for the values of pageblock_order based on
  * the kernel config
  */
-void __init set_pageblock_order(void)
+void __paginginit set_pageblock_order(void)
 {
 }
 

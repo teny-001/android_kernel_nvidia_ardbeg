@@ -271,8 +271,8 @@ bsg_map_hdr(struct bsg_device *bd, struct sg_io_v4 *hdr, fmode_t has_write_perm,
 	 * map scatter-gather elements separately and string them to request
 	 */
 	rq = blk_get_request(q, rw, GFP_KERNEL);
-	if (!rq)
-		return ERR_PTR(-ENOMEM);
+	if (IS_ERR(rq))
+		return rq;
 	ret = blk_fill_sgv4_hdr_rq(q, rq, hdr, bd, has_write_perm);
 	if (ret)
 		goto out;
@@ -284,8 +284,8 @@ bsg_map_hdr(struct bsg_device *bd, struct sg_io_v4 *hdr, fmode_t has_write_perm,
 		}
 
 		next_rq = blk_get_request(q, READ, GFP_KERNEL);
-		if (!next_rq) {
-			ret = -ENOMEM;
+		if (IS_ERR(next_rq)) {
+			ret = PTR_ERR(next_rq);
 			goto out;
 		}
 		rq->next_rq = next_rq;
@@ -674,6 +674,9 @@ bsg_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
 	int ret;
 
 	dprintk("%s: write %Zd bytes\n", bd->name, count);
+
+	if (unlikely(segment_eq(get_fs(), KERNEL_DS)))
+		return -EINVAL;
 
 	bsg_set_block(bd, file);
 

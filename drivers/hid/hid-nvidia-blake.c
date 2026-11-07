@@ -1,7 +1,7 @@
 /*
  * HID driver for NVIDIA Shield Wireless Joystick
  *
- * Copyright (c) 2013-2014, NVIDIA Corporation. All Rights Reserved.
+ * Copyright (c) 2013-2016, NVIDIA Corporation. All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -48,7 +48,7 @@
 #define GESTURE_MODE_STR "gesture"
 #define ABSOLUTE_MODE_STR "absolute"
 #define DISABLED_MODE_STR "disabled"
-#define UNKNOW_MODE_STR "unknown"
+#define UNKNOWN_MODE_STR "unknown"
 
 #define MAX_REL 255
 #define MAX_ABS 65535
@@ -117,20 +117,6 @@ static __s32 scale_rel_to_abs(__s32 rel)
 	return val;
 }
 
-
-static __u8 *nv_report_fixup(struct hid_device *hdev, __u8 *rdesc,
-		unsigned int *rsize)
-{
-	/*
-	 * This driver converts from absolute to relative, so lets make
-	 * it register as a relative mouse
-	 */
-	if (*rsize == 232 && rdesc[185] == 0x02) {
-		rdesc[185] = 0x06;
-	}
-	return rdesc;
-}
-
 static int nvidia_raw_event(struct hid_device *hdev,
 		struct hid_report *report, u8 *data, int size) {
 
@@ -145,23 +131,22 @@ static int nvidia_raw_event(struct hid_device *hdev,
 	signed short relx_raw, rely_raw;
 
 	if (!report)
-		return 1;
+		return -EINVAL;
 	id = report->id;
 
 	if (!loc)
-		return 1;
+		return -EINVAL;
 
 	/* If not valid touch events, let generic driver to handle this */
 	if (id != TOUCH_REPORT_ID)
 		return 0;
 
-	/* If driver is in disabled mode,
-	 * don't report anything to generic
-	 * driver
-	 */
+	/* If driver is disabled, don't report anything to generic driver */
 	if (loc->mode == DISABLED_MODE)
 		return 1;
 
+	if (!data)
+		return -EINVAL;
 	action = (data[1] & TOUCH_ACTION_MASK) >> TOUCH_ACTION_SHFT;
 	x = data[2];
 	y = data[4];
@@ -173,7 +158,7 @@ static int nvidia_raw_event(struct hid_device *hdev,
 	else if (loc->action && !action)
 		release = 1;
 	else if (!loc->action && !action)
-		return 1;/* Double release, don't do anything */
+		return 1; /* Double release, don't do anything */
 
 	relx_raw = x - loc->x;
 	rely_raw = y - loc->y;
@@ -187,58 +172,47 @@ static int nvidia_raw_event(struct hid_device *hdev,
 
 	loc->x = x;
 	loc->y = y;
-	if (!press) {
-		/*
-		 * Not a press event, we
-		 * need to report it to input subsystem
-		 *
-		 * If driver is in absolute mode, report
-		 * raw absolute data to generic driver
-		 *
-		 * If driver is in gesture mode, report
-		 * raw relative data to generic driver
-		 */
-		if (loc->mode == ABSOLUTE_MODE) {
-			if (loc->tp_size == 8) {
-				data[2] = x & 0xff;
-				data[3] = y & 0xff;
-			}
-			/* otherwise we don't need to do anything */
-			return 0;
-		} else if (loc->mode == GESTURE_MODE) {
-			if (loc->tp_size == 8) {
-				data[2] = relx_raw & 0xff;
-				data[3] = rely_raw & 0xff;
-			} else {
-				data[2] = relx_raw & 0xff;
-				data[3] = relx_raw >> 8;
-				data[4] = rely_raw & 0xff;
-				data[5] = rely_raw >> 8;
-			}
-			if (release)
-				loc->release = 1;
-			else
-				loc->release = 0;
-			return 0;
-		} else {
-			if (loc->tp_size == 8) {
-				data[2] = relx & 0xff;
-				data[3] = rely & 0xff;
-			} else {
-				data[2] = relx & 0xff;
-				data[3] = relx >> 8;
-				data[4] = rely & 0xff;
-				data[5] = rely >> 8;
-			}
-			return 0;
-		}
-	} else {
-		/*
-		 * if it's a press event,
-		 * don't report.
-		 */
+
+	/* If it's a press event, don't report. */
+	if (press)
 		return 1;
+
+	/* Not a press event, we need to report it to input subsystem,
+	 * set values and pass to generic driver */
+	if (loc->mode == ABSOLUTE_MODE) {
+		/* Report raw absolute data to generic driver */
+		if (loc->tp_size == 8) {
+			data[2] = x & 0xff;
+			data[3] = y & 0xff;
+		}
+	} else if (loc->mode == GESTURE_MODE) {
+		/* Report raw relative data to generic driver */
+		if (loc->tp_size == 8) {
+			data[2] = relx_raw & 0xff;
+			data[3] = rely_raw & 0xff;
+		} else {
+			data[2] = relx_raw & 0xff;
+			data[3] = relx_raw >> 8;
+			data[4] = rely_raw & 0xff;
+			data[5] = rely_raw >> 8;
+		}
+		if (release)
+			loc->release = 1;
+		else
+			loc->release = 0;
+	} else {
+		/* MOUSE_MODE */
+		if (loc->tp_size == 8) {
+			data[2] = relx & 0xff;
+			data[3] = rely & 0xff;
+		} else {
+			data[2] = relx & 0xff;
+			data[3] = relx >> 8;
+			data[4] = rely & 0xff;
+			data[5] = rely >> 8;
+		}
 	}
+	return 0;
 }
 
 static int nvidia_event(struct hid_device *hdev, struct hid_field *field,
@@ -268,9 +242,8 @@ static int nvidia_event(struct hid_device *hdev, struct hid_field *field,
 		value = scale_rel_to_abs(value);
 		input_event(field->hidinput->input, EV_ABS, usage->code,
 				value);
-		return 1;
 	} else {
-
+		/* GESTURE_MODE */
 		value = (value > 1) ? 1 : ((value < -1) ? -1 : 0);
 		if (usage->code == REL_X)
 			keycode = ABS_HAT0X;
@@ -283,8 +256,8 @@ static int nvidia_event(struct hid_device *hdev, struct hid_field *field,
 		else
 			input_event(field->hidinput->input, EV_ABS, keycode,
 				0);
-		return 1;
 	}
+	return 1;
 }
 
 static ssize_t blake_show_mode(struct device *dev,
@@ -298,7 +271,7 @@ static ssize_t blake_show_mode(struct device *dev,
 		(struct nvidia_tp_loc *)hid_get_drvdata(hdev);
 
 	if (!loc)
-		return snprintf(buf, MAX_CHAR, UNKNOW_MODE_STR);
+		return snprintf(buf, MAX_CHAR, UNKNOWN_MODE_STR);
 
 	switch (loc->mode) {
 	case MOUSE_MODE:
@@ -310,7 +283,7 @@ static ssize_t blake_show_mode(struct device *dev,
 	case DISABLED_MODE:
 		return snprintf(buf, MAX_CHAR, DISABLED_MODE_STR);
 	default:
-		return snprintf(buf, MAX_CHAR, UNKNOW_MODE_STR);
+		return snprintf(buf, MAX_CHAR, UNKNOWN_MODE_STR);
 	}
 }
 
@@ -370,6 +343,9 @@ static ssize_t blake_store_speed(struct device *dev,
 	if (!loc)
 		return count;
 
+	if (!buf)
+		return count;
+
 	if (!kstrtoul(buf, 10, &speed_val)) {
 		if (speed_val > MAX_SPEED)
 			return count;
@@ -379,33 +355,8 @@ static ssize_t blake_store_speed(struct device *dev,
 	return count;
 }
 
-
-static int nvidia_ff_play(struct input_dev *dev, void *data,
-			 struct ff_effect *effect)
-{
-	struct hid_device *hid = input_get_drvdata(dev);
-	struct nvidia_tp_loc *loc = data;
-	int left, right, length;
-
-	left = effect->u.rumble.strong_magnitude;
-	right = effect->u.rumble.weak_magnitude;
-	length = effect->replay.length;
-
-	dbg_hid("called with 0x%04x 0x%04x 0x%04x", left, right, length);
-
-	length = length > 10000 ? 10000 : length;
-
-	loc->ff_report->field[0]->value[0] = left;
-	loc->ff_report->field[0]->value[1] = right;
-	loc->ff_report->field[0]->value[2] = length;
-
-	hid_hw_request(hid, loc->ff_report, HID_REQ_SET_REPORT);
-
-	return 0;
-}
-
-
-static int nvidia_find_tp_len(struct hid_device *hdev, struct nvidia_tp_loc *loc)
+static int nvidia_find_tp_len(struct hid_device *hdev,
+	struct nvidia_tp_loc *loc)
 {
 	struct hid_report *report;
 	struct list_head *report_list =
@@ -421,10 +372,14 @@ static int nvidia_find_tp_len(struct hid_device *hdev, struct nvidia_tp_loc *loc
 	loc->tp_size = 8;
 	list_for_each_entry(report, report_list, list) {
 		if (report->id == TOUCH_REPORT_ID) {
-			/* check if we are reporting u8 or u16 for x/y size, need to handle FW change */
+			/* check if we are reporting u8 or u16
+			 * for x/y size need to handle FW change
+			 */
 			for (i = 0; i < report->maxfield; i++) {
-				if (report->field[i]->application == HID_GD_MOUSE) {
-					if (report->field[i]->report_size == 16) {
+				if (report->field[i]->application
+						== HID_GD_MOUSE) {
+					if (report->field[i]->report_size
+						== 16) {
 						loc->tp_size = 16;
 						break;
 					}
@@ -436,109 +391,25 @@ static int nvidia_find_tp_len(struct hid_device *hdev, struct nvidia_tp_loc *loc
 	return 0;
 }
 
-static int nvidia_init_ff(struct hid_device *hdev, struct nvidia_tp_loc *loc)
-{
-	struct hid_report *report;
-	struct hid_input *hidinput = list_entry(hdev->inputs.next,
-						struct hid_input, list);
-	struct list_head *report_list =
-			&hdev->report_enum[HID_OUTPUT_REPORT].report_list;
-	struct input_dev *dev = hidinput->input;
-	int error;
-
-	if (list_empty(report_list)) {
-		hid_err(hdev, "no output reports found\n");
-		return -ENODEV;
-	}
-
-	list_for_each_entry(report, report_list, list) {
-		if (report->maxfield < 1) {
-			hid_warn(hdev, "no fields in the report\n");
-			continue;
-		}
-
-		if (report->field[0]->report_count != 3) {
-			hid_warn(hdev, "not right number of values in the field\n");
-			continue;
-		}
-
-		goto found_report;
-	}
-	hid_warn(hdev, "FF report not found\n");
-	loc->ff_report = NULL;
-	return -ENODEV;
-
-	found_report:
-	loc->ff_report = report;
-
-	set_bit(FF_RUMBLE, dev->ffbit);
-	error = input_ff_create_memless(dev, loc, nvidia_ff_play);
-
-	if (error) {
-		loc->ff_report = NULL;
-		clear_bit(FF_RUMBLE, dev->ffbit);
-		hid_warn(hdev, "Couldn't create FF device");
-		return error;
-	}
-
-	hid_info(hdev, "Force feedback enabled\n");
-
-	return 0;
-}
-
 static DEVICE_ATTR(speed, S_IRUGO | S_IWUSR,
 	blake_show_speed, blake_store_speed);
 static DEVICE_ATTR(mode, S_IRUGO | S_IWUSR,
 	blake_show_mode, blake_store_mode);
-
-static int nvidia_fixup_trackpad_usage(struct hid_device *hdev)
-{
-	struct hid_report *report;
-	struct list_head *report_list =
-			&hdev->report_enum[HID_INPUT_REPORT].report_list;
-	u8 i;
-
-	if (list_empty(report_list)) {
-		hid_err(hdev, "no output reports found\n");
-		return -ENODEV;
-	}
-
-	list_for_each_entry(report, report_list, list) {
-		if (report->id == TOUCH_REPORT_ID) {
-			/*
-			 * Generic HID drivers do not work well Blake trackpad.
-			 * So, fw uses vendor specific usage for the trackpad.
-			 * Change the usage internally to register trackpad as
-			 * a relative mouse.
-			 */
-			for (i = 0; i < report->maxfield; i++) {
-				report->field[i]->physical = HID_GD_MOUSE;
-				report->field[i]->application = HID_GD_MOUSE;
-			}
-		}
-	}
-
-	return 0;
-}
 
 static int nvidia_probe(struct hid_device *hdev, const struct hid_device_id *id)
 {
 	int ret;
 	struct nvidia_tp_loc *loc;
 
-	loc = (struct nvidia_tp_loc *)
-		kmalloc(sizeof(struct nvidia_tp_loc *), GFP_KERNEL);
-
-	if (!loc) {
-		hid_err(hdev, "cannot alloc device touchpad state\n");
+	loc = devm_kzalloc(&hdev->dev, sizeof(*loc), GFP_KERNEL);
+	if (!loc)
 		return -ENOMEM;
-	}
 
 	loc->x = TOUCHPAD_DEFAULT_X;
 	loc->y = TOUCHPAD_DEFAULT_Y;
 	loc->action = 0;
 	loc->speed = DEFAULT_SPEED;
-	loc->mode = MOUSE_MODE;
+	loc->mode = DISABLED_MODE;
 	hid_set_drvdata(hdev, loc);
 
 	/* Parse the HID report now */
@@ -548,28 +419,28 @@ static int nvidia_probe(struct hid_device *hdev, const struct hid_device_id *id)
 		goto err_parse;
 	}
 
-	ret = nvidia_fixup_trackpad_usage(hdev);
-	if (ret)
-		goto err_parse;
-
 	ret = hid_hw_start(hdev, HID_CONNECT_DEFAULT & ~HID_CONNECT_FF);
 	if (ret)
 		goto err_parse;
 
-	nvidia_init_ff(hdev, loc);
 	nvidia_find_tp_len(hdev, loc);
 
 	ret = device_create_file(&hdev->dev, &dev_attr_speed);
-	if (ret)
-		hid_warn(hdev, "cannot create sysfs for speed\n");
+	if (ret) {
+		hid_warn(hdev,
+			"cannot create sysfs speed attribute err: %d\n", ret);
+	}
+
 	ret = device_create_file(&hdev->dev, &dev_attr_mode);
 	if (ret)
-		hid_warn(hdev, "cannot create sysfs for mode\n");
+		hid_warn(hdev,
+			"cannot create sysfs mode attribute err: %d\n", ret);
+
+	kobject_uevent(&hdev->dev.kobj, KOBJ_CHANGE);
 
 	return 0;
 
 err_parse:
-	kfree(loc);
 	return ret;
 }
 
@@ -587,8 +458,8 @@ static void nvidia_remove(struct hid_device *hdev)
 }
 
 static int nvidia_input_mapped(struct hid_device *hdev, struct hid_input *hi,
-				  struct hid_field *field, struct hid_usage *usage,
-				  unsigned long **bit, int *max)
+			struct hid_field *field, struct hid_usage *usage,
+			unsigned long **bit, int *max)
 {
 	int a = field->logical_minimum;
 	int b = field->logical_maximum;
@@ -633,7 +504,6 @@ static struct hid_driver nvidia_driver = {
 	.id_table = nvidia_devices,
 	.input_mapped = nvidia_input_mapped,
 	.raw_event = nvidia_raw_event,
-	.report_fixup = nv_report_fixup,
 	.event = nvidia_event,
 	.probe = nvidia_probe,
 	.remove = nvidia_remove,

@@ -20,11 +20,19 @@
 
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
+#include <linux/dma-attrs.h>
 
 struct gk20a;
 struct channel_gk20a;
 struct gr_ctx_buffer_desc;
 struct gk20a_scale_profile;
+
+struct secure_page_buffer {
+	void (*destroy)(struct platform_device *, struct secure_page_buffer *);
+	size_t size;
+	u64 iova;
+	struct dma_attrs attrs;
+};
 
 struct gk20a_platform {
 #ifdef CONFIG_TEGRA_GK20A
@@ -39,6 +47,9 @@ struct gk20a_platform {
 	/* Should be populated at probe. */
 	bool has_syncpoints;
 
+	/* flag to set sync destroy aggressiveness */
+	bool aggressive_sync_destroy;
+
 	/* Should be populated by probe. */
 	struct dentry *debugfs;
 
@@ -52,6 +63,36 @@ struct gk20a_platform {
 
 	/* Delay before clock gated */
 	int clockgate_delay;
+
+	/* Second Level Clock Gating: true = enable false = disable */
+	bool enable_slcg;
+
+	/* Block Level Clock Gating: true = enable flase = disable */
+	bool enable_blcg;
+
+	/* Engine Level Clock Gating: true = enable flase = disable */
+	bool enable_elcg;
+
+	/* Engine Level Power Gating: true = enable flase = disable */
+	bool enable_elpg;
+
+	/* Adaptative ELPG: true = enable flase = disable */
+	bool enable_aelpg;
+
+	/* Enable SMMU bypass by default */
+	bool bypass_smmu;
+
+	/* Disable big page support */
+	bool disable_bigpage;
+
+	/*
+	 * gk20a_do_idle() API can take GPU either into rail gate or CAR reset
+	 * This flag can be used to force CAR reset case instead of rail gate
+	 */
+	bool force_reset_in_do_idle;
+
+	/* Default big page size 64K or 128K */
+	u32 default_big_page_size;
 
 	/* Initialize the platform interface of the gk20a driver.
 	 *
@@ -71,6 +112,16 @@ struct gk20a_platform {
 	 */
 	int (*late_probe)(struct platform_device *dev);
 
+	/* Remove device after power management has been done
+	 */
+	int (*remove)(struct platform_device *dev);
+
+	/* Poweron platform dependencies */
+	int (*busy)(struct platform_device *dev);
+
+	/* Powerdown platform dependencies */
+	void (*idle)(struct platform_device *dev);
+
 	/* This function is called to allocate secure memory (memory that the
 	 * CPU cannot see). The function should fill the context buffer
 	 * descriptor (especially fields destroy, sgt, size).
@@ -78,6 +129,14 @@ struct gk20a_platform {
 	int (*secure_alloc)(struct platform_device *dev,
 			    struct gr_ctx_buffer_desc *desc,
 			    size_t size);
+
+	/* Function to allocate a secure buffer of PAGE_SIZE at probe time.
+	 * This is also helpful to trigger secure memory resizing
+	 * while GPU is off
+	 */
+	int (*secure_page_alloc)(struct platform_device *dev);
+	struct secure_page_buffer secure_buffer;
+	bool secure_alloc_ready;
 
 	/* Device is going to be suspended */
 	int (*suspend)(struct device *);
@@ -87,6 +146,10 @@ struct gk20a_platform {
 
 	/* Called to turn on the device */
 	int (*unrailgate)(struct platform_device *dev);
+	struct mutex railgate_lock;
+
+	/* Called to check state of device */
+	bool (*is_railgated)(struct platform_device *dev);
 
 	/* Postscale callback is called after frequency change */
 	void (*postscale)(struct platform_device *pdev,
@@ -110,6 +173,20 @@ struct gk20a_platform {
 	 * of the CPU.
 	 */
 	void (*dump_platform_dependencies)(struct platform_device *dev);
+
+	/* Callbacks to assert/deassert GPU reset */
+	int (*reset_assert)(struct platform_device *pdev);
+	int (*reset_deassert)(struct platform_device *pdev);
+	struct clk *clk_reset;
+	struct dvfs_rail *gpu_rail;
+
+	bool virtual_dev;
+#ifdef CONFIG_TEGRA_GR_VIRTUALIZATION
+	u64 virt_handle;
+	struct task_struct *intr_handler;
+#endif
+
+	bool has_cde;
 };
 
 static inline struct gk20a_platform *gk20a_get_platform(
@@ -121,6 +198,10 @@ static inline struct gk20a_platform *gk20a_get_platform(
 extern struct gk20a_platform gk20a_generic_platform;
 #ifdef CONFIG_TEGRA_GK20A
 extern struct gk20a_platform gk20a_tegra_platform;
+extern struct gk20a_platform gm20b_tegra_platform;
+#ifdef CONFIG_TEGRA_GR_VIRTUALIZATION
+extern struct gk20a_platform vgpu_tegra_platform;
+#endif
 #endif
 
 static inline bool gk20a_platform_has_syncpoints(struct platform_device *dev)
@@ -128,5 +209,9 @@ static inline bool gk20a_platform_has_syncpoints(struct platform_device *dev)
 	struct gk20a_platform *p = gk20a_get_platform(dev);
 	return p->has_syncpoints;
 }
+
+int gk20a_tegra_busy(struct platform_device *dev);
+void gk20a_tegra_idle(struct platform_device *dev);
+void gk20a_tegra_debug_dump(struct platform_device *pdev);
 
 #endif

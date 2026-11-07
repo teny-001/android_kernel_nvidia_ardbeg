@@ -139,6 +139,7 @@ config MACVLAN
 config MACVTAP
 	tristate "MAC-VLAN based tap driver"
 	depends on MACVLAN
+	depends on INET
 	help
 	  This adds a specialized tap character device driver that is based
 	  on the MAC-VLAN network interface, called macvtap. A macvtap device
@@ -209,6 +210,7 @@ config RIONET_RX_SIZE
 
 config TUN
 	tristate "Universal TUN/TAP device driver support"
+	depends on INET
 	select CRC32
 	---help---
 	  TUN/TAP provides packet reception and transmission for user space
@@ -362,5 +364,14 @@ config MHI_NETDEV
            default y if MHI
            help
             This is the net device manadatory used by MHI stack
+
+config TEGRA_HV_NET
+	tristate "Tegra Hypervisor Network"
+	depends on TEGRA_HV_MANAGER
+	help
+	  Add support for emulating a network device on tegra hypervisor systems.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called tegra_hv_net.
 
 endif # NETDEVICES

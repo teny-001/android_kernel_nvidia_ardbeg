@@ -1,12 +1,15 @@
 /*
  * drivers/media/video/tegra/nvavp/nvavp_dev.c
  *
- * Copyright (c) 2011-2014, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2011-2017, NVIDIA CORPORATION.  All rights reserved.
  *
  * This file is licensed under the terms of the GNU General Public License
  * version 2. This program is licensed "as is" without any warranty of any
  * kind, whether express or implied.
  */
+
+#define CREATE_TRACE_POINTS
+#include <trace/events/nvavp.h>
 
 #include <linux/uaccess.h>
 #include <linux/clk.h>
@@ -44,8 +47,8 @@
 #include <linux/sched.h>
 #include <linux/memblock.h>
 #include <linux/anon_inodes.h>
+#include <linux/tegra_pm_domains.h>
 
-#include <mach/pm_domains.h>
 
 #include <linux/pm_qos.h>
 
@@ -54,6 +57,10 @@
 #include <linux/of_platform.h>
 #include <linux/of_address.h>
 #include <linux/tegra-timer.h>
+
+#ifdef CONFIG_TRUSTED_LITTLE_KERNEL
+#include <linux/ote_protocol.h>
+#endif
 
 #if defined(CONFIG_TEGRA_AVP_KERNEL_ON_MMU)
 #include "../avp/headavp.h"
@@ -102,6 +109,13 @@ static void __iomem *nvavp_reg_base;
 
 #define SCLK_BOOST_RATE		40000000
 
+#ifdef CONFIG_PM_GENERIC_DOMAINS_OF
+static struct of_device_id tegra_vde_pd[] = {
+	{ .compatible = "nvidia,tegra132-vde-pd", },
+	{ .compatible = "nvidia,tegra124-vde-pd", },
+};
+#endif
+
 static bool boost_sclk;
 #if defined(CONFIG_TEGRA_NVAVP_AUDIO)
 static bool audio_enabled;
@@ -135,6 +149,7 @@ struct nvavp_info {
 	int				mbox_from_avp_pend_irq;
 
 	struct mutex			open_lock;
+	struct mutex			submit_lock;
 	int				refcount;
 	int				video_initialized;
 	int				video_refcnt;
@@ -466,8 +481,9 @@ static void nvavp_set_channel_control_area(struct nvavp_info *nvavp, int channel
 	writel(0x0, &control->get);
 
 	pr_debug("nvavp_set_channel_control_area for channel_id (%d):\
-		control->put (0x%08x) control->get (0x%08x)\n",
-		channel_id, (u32) &control->put, (u32) &control->get);
+		control->put (0x%08lx) control->get (0x%08lx)\n",
+		channel_id, (uintptr_t) &control->put,
+		(uintptr_t) &control->get);
 
 	/* Clock gating disabled for video and enabled for audio  */
 	if (IS_VIDEO_CHANNEL_ID(channel_id))
@@ -516,11 +532,19 @@ static struct clk *nvavp_clk_get(struct nvavp_info *nvavp, int id)
 static int nvavp_powergate_vde(struct nvavp_info *nvavp)
 {
 	int ret = 0;
+	int partition_id;
 
 	dev_dbg(&nvavp->nvhost_dev->dev, "%s++\n", __func__);
 
 	/* Powergate VDE */
-	ret = tegra_powergate_partition(TEGRA_POWERGATE_VDEC);
+#ifdef CONFIG_PM_GENERIC_DOMAINS_OF
+	partition_id = tegra_pd_get_powergate_id(tegra_vde_pd);
+	if (partition_id < 0)
+		return -EINVAL;
+#else
+	partition_id = TEGRA_POWERGATE_VDEC;
+#endif
+	ret = tegra_powergate_partition(partition_id);
 	if (ret)
 		dev_err(&nvavp->nvhost_dev->dev,
 				"%s: powergate failed\n",
@@ -532,11 +556,19 @@ static int nvavp_powergate_vde(struct nvavp_info *nvavp)
 static int nvavp_unpowergate_vde(struct nvavp_info *nvavp)
 {
 	int ret = 0;
+	int partition_id;
 
 	dev_dbg(&nvavp->nvhost_dev->dev, "%s++\n", __func__);
 
 	/* UnPowergate VDE */
-	ret = tegra_unpowergate_partition(TEGRA_POWERGATE_VDEC);
+#ifdef CONFIG_PM_GENERIC_DOMAINS_OF
+	partition_id = tegra_pd_get_powergate_id(tegra_vde_pd);
+	if (partition_id < 0)
+		return -EINVAL;
+#else
+	partition_id = TEGRA_POWERGATE_VDEC;
+#endif
+	ret = tegra_unpowergate_partition(partition_id);
 	if (ret)
 		dev_err(&nvavp->nvhost_dev->dev,
 				"%s: unpowergate failed\n",
@@ -616,6 +648,11 @@ static void clock_disable_handler(struct work_struct *work)
 	channel_info = nvavp_get_channel_info(nvavp, NVAVP_VIDEO_CHANNEL);
 	mutex_lock(&channel_info->pushbuffer_lock);
 	mutex_lock(&nvavp->open_lock);
+
+	trace_nvavp_clock_disable_handler(channel_info->os_control->put,
+				channel_info->os_control->get,
+				nvavp->pending);
+
 	if (nvavp_check_idle(nvavp, NVAVP_VIDEO_CHANNEL) && nvavp->pending) {
 		nvavp->pending = false;
 		nvavp_clks_disable(nvavp);
@@ -868,6 +905,7 @@ static int nvavp_pushbuffer_update(struct nvavp_info *nvavp, u32 phys_addr,
 	u32 wordcount = 0;
 	u32 index, value = -1;
 	int ret = 0;
+	u32 max_index = 0;
 
 	mutex_lock(&nvavp->open_lock);
 	nvavp_runtime_get(nvavp);
@@ -876,13 +914,16 @@ static int nvavp_pushbuffer_update(struct nvavp_info *nvavp, u32 phys_addr,
 
 	control = channel_info->os_control;
 	pr_debug("nvavp_pushbuffer_update for channel_id (%d):\
-		control->put (0x%x) control->get (0x%x)\n",
-		channel_id, (u32) &control->put, (u32) &control->get);
+		control->put (0x%lx) control->get (0x%lx)\n",
+		channel_id, (uintptr_t) &control->put,
+		(uintptr_t) &control->get);
 
 	mutex_lock(&channel_info->pushbuffer_lock);
 
 	/* check for pushbuffer wrapping */
-	if (channel_info->pushbuf_index >= channel_info->pushbuf_fence)
+	max_index = channel_info->pushbuf_fence;
+	max_index = ext_ucode_flag ? max_index : max_index - (sizeof(u32) * 4);
+	if (channel_info->pushbuf_index >= max_index)
 		channel_info->pushbuf_index = 0;
 
 	if (!ext_ucode_flag) {
@@ -978,6 +1019,10 @@ static int nvavp_pushbuffer_update(struct nvavp_info *nvavp, u32 phys_addr,
 		syncpt->value = value;
 	}
 
+	trace_nvavp_pushbuffer_update(channel_id, control->put, control->get,
+				phys_addr, gather_count,
+				sizeof(struct nvavp_syncpt), syncpt);
+
 err_exit:
 	mutex_unlock(&channel_info->pushbuffer_lock);
 	nvavp_runtime_put(nvavp);
@@ -1022,13 +1067,13 @@ static int nvavp_load_ucode(struct nvavp_info *nvavp)
 		}
 
 		dev_info(&nvavp->nvhost_dev->dev,
-			"read ucode firmware from '%s' (%d bytes)\n",
+			"read ucode firmware from '%s' (%zu bytes)\n",
 			fw_ucode_file, nvavp_ucode_fw->size);
 
 		ptr = (void *)nvavp_ucode_fw->data;
 
 		if (strncmp((const char *)ptr, "NVAVPAPP", 8)) {
-			dev_info(&nvavp->nvhost_dev->dev,
+			dev_dbg(&nvavp->nvhost_dev->dev,
 				"ucode hdr string mismatch\n");
 			ret = -EINVAL;
 			goto err_req_ucode;
@@ -1095,13 +1140,13 @@ static int nvavp_load_os(struct nvavp_info *nvavp, char *fw_os_file)
 		}
 
 		dev_info(&nvavp->nvhost_dev->dev,
-			"read firmware from '%s' (%d bytes)\n",
+			"read firmware from '%s' (%zu bytes)\n",
 			fw_os_file, nvavp_os_fw->size);
 
 		ptr = (void *)nvavp_os_fw->data;
 
 		if (strncmp((const char *)ptr, "NVAVP-OS", 8)) {
-			dev_info(&nvavp->nvhost_dev->dev,
+			dev_dbg(&nvavp->nvhost_dev->dev,
 				"os hdr string mismatch\n");
 			ret = -EINVAL;
 			goto err_os_bin;
@@ -1130,7 +1175,7 @@ static int nvavp_load_os(struct nvavp_info *nvavp, char *fw_os_file)
 		memcpy(os_info->os_bin, ptr, os_info->size);
 		memset(os_info->data + os_info->size, 0, SZ_1M - os_info->size);
 
-		dev_info(&nvavp->nvhost_dev->dev,
+		dev_dbg(&nvavp->nvhost_dev->dev,
 			"entry=%08x control=%08x debug=%08x size=%d\n",
 			os_info->entry_offset, os_info->control_offset,
 			os_info->debug_offset, os_info->size);
@@ -1140,7 +1185,7 @@ static int nvavp_load_os(struct nvavp_info *nvavp, char *fw_os_file)
 	memcpy(os_info->data, os_info->os_bin, os_info->size);
 	os_info->reset_addr = os_info->phys + os_info->entry_offset;
 
-	dev_info(&nvavp->nvhost_dev->dev,
+	dev_dbg(&nvavp->nvhost_dev->dev,
 		"AVP os at vaddr=%p paddr=%llx reset_addr=%llx\n",
 		os_info->data, (u64)(os_info->phys), (u64)os_info->reset_addr);
 	return 0;
@@ -1176,14 +1221,14 @@ static int nvavp_os_init(struct nvavp_info *nvavp)
 #if defined(CONFIG_TEGRA_AVP_KERNEL_ON_MMU) /* Tegra2 with AVP MMU */
 	/* paddr is phys address */
 	/* vaddr is AVP_KERNEL_VIRT_BASE */
-	dev_info(&nvavp->nvhost_dev->dev,
+	dev_dbg(&nvavp->nvhost_dev->dev,
 		"using AVP MMU to relocate AVP os\n");
 	sprintf(fw_os_file, "nvavp_os.bin");
 	nvavp->os_info.reset_addr = AVP_KERNEL_VIRT_BASE;
 #elif defined(CONFIG_TEGRA_AVP_KERNEL_ON_SMMU) /* Tegra3 with SMMU */
 	/* paddr is any address behind SMMU */
 	/* vaddr is TEGRA_SMMU_BASE */
-	dev_info(&nvavp->nvhost_dev->dev,
+	dev_dbg(&nvavp->nvhost_dev->dev,
 		"using SMMU at %lx to load AVP kernel\n",
 		(unsigned long)nvavp->os_info.phys);
 	BUG_ON(nvavp->os_info.phys != 0xeff00000
@@ -1193,7 +1238,7 @@ static int nvavp_os_init(struct nvavp_info *nvavp)
 		(unsigned long)nvavp->os_info.phys);
 	nvavp->os_info.reset_addr = nvavp->os_info.phys;
 #else /* nvmem= carveout */
-	dev_info(&nvavp->nvhost_dev->dev,
+	dev_dbg(&nvavp->nvhost_dev->dev,
 		"using nvmem= carveout at %llx to load AVP os\n",
 		(u64)nvavp->os_info.phys);
 	sprintf(fw_os_file, "nvavp_os_%08llx.bin", (u64)nvavp->os_info.phys);
@@ -1222,7 +1267,10 @@ err_exit:
 static int nvavp_init(struct nvavp_info *nvavp, int channel_id)
 {
 	int ret = 0;
-	int video_initialized = 0, audio_initialized = 0;
+	int video_initialized = 0;
+#if defined(CONFIG_TEGRA_NVAVP_AUDIO)
+	int audio_initialized = 0;
+#endif
 
 	nvavp->init_task = current;
 
@@ -1269,6 +1317,7 @@ err_exit:
 #define TIMER_PCR	0x4
 #define TIMER_PCR_INTR	(1 << 30)
 
+/* This should be called with the open_lock held */
 static void nvavp_uninit(struct nvavp_info *nvavp)
 {
 	int video_initialized, audio_initialized = 0;
@@ -1291,7 +1340,6 @@ static void nvavp_uninit(struct nvavp_info *nvavp)
 
 	if (video_initialized) {
 		pr_debug("nvavp_uninit nvavp->video_initialized\n");
-		cancel_work_sync(&nvavp->clock_disable_work);
 		nvavp_halt_vde(nvavp);
 		nvavp_set_video_init_status(nvavp, 0);
 		video_initialized = 0;
@@ -1381,6 +1429,8 @@ static int nvavp_map_iova(struct file *filp, unsigned int cmd,
 
 	map_arg.addr = (__u32)addr;
 
+	trace_nvavp_map_iova(clientctx->channel_id, map_arg.fd, map_arg.addr);
+
 	if (copy_to_user((void __user *)arg, &map_arg,
 		sizeof(struct nvavp_map_args))) {
 		dev_err(&nvavp->nvhost_dev->dev,
@@ -1412,6 +1462,8 @@ static int nvavp_unmap_iova(struct file *filp, unsigned long arg)
 			"invalid buffer handle %08x\n", map_arg.fd);
 		return PTR_ERR(dmabuf);
 	}
+
+	trace_nvavp_unmap_iova(clientctx->channel_id, map_arg.fd, map_arg.addr);
 
 	nvavp_release_iova_addr(clientctx, dmabuf, (dma_addr_t)map_arg.addr);
 	dma_buf_put(dmabuf);
@@ -1449,6 +1501,10 @@ static int nvavp_set_clock_ioctl(struct file *filp, unsigned int cmd,
 
 	config.rate = clk_get_rate(c);
 	clk_disable_unprepare(c);
+
+	trace_nvavp_set_clock_ioctl(clientctx->channel_id, config.id,
+				config.rate);
+
 	if (copy_to_user((void __user *)arg, &config, sizeof(struct nvavp_clock_args)))
 		return -EFAULT;
 
@@ -1474,6 +1530,9 @@ static int nvavp_get_clock_ioctl(struct file *filp, unsigned int cmd,
 	config.rate = clk_get_rate(c);
 	clk_disable_unprepare(c);
 
+	trace_nvavp_get_clock_ioctl(clientctx->channel_id, config.id,
+								config.rate);
+
 	if (copy_to_user((void __user *)arg, &config, sizeof(struct nvavp_clock_args)))
 		return -EFAULT;
 
@@ -1493,6 +1552,9 @@ static int nvavp_get_syncpointid_ioctl(struct file *filp, unsigned int cmd,
 		else
 			return 0;
 	}
+
+	trace_nvavp_get_syncpointid_ioctl(clientctx->channel_id, id);
+
 	return -EFAULT;
 }
 
@@ -1515,18 +1577,31 @@ static int nvavp_pushbuffer_submit_ioctl(struct file *filp, unsigned int cmd,
 
 	syncpt.id = NVSYNCPT_INVALID;
 	syncpt.value = 0;
+	mutex_lock(&nvavp->submit_lock);
 
 	if (_IOC_DIR(cmd) & _IOC_WRITE) {
 		if (copy_from_user(&hdr, (void __user *)arg,
-			sizeof(struct nvavp_pushbuffer_submit_hdr)))
+			sizeof(struct nvavp_pushbuffer_submit_hdr))) {
+			mutex_unlock(&nvavp->submit_lock);
 			return -EFAULT;
+		}
 	}
 
-	if (!hdr.cmdbuf.mem)
+	if (!hdr.cmdbuf.mem) {
+		mutex_unlock(&nvavp->submit_lock);
 		return 0;
+	}
+
+	if (hdr.num_relocs > NVAVP_MAX_RELOCATION_COUNT) {
+		dev_err(&nvavp->nvhost_dev->dev,
+			"invalid num_relocs %d\n", hdr.num_relocs);
+			mutex_unlock(&nvavp->submit_lock);
+		return -EINVAL;
+	}
 
 	if (copy_from_user(clientctx->relocs, (void __user *)hdr.relocs,
 			sizeof(struct nvavp_reloc) * hdr.num_relocs)) {
+		mutex_unlock(&nvavp->submit_lock);
 		return -EFAULT;
 	}
 
@@ -1534,7 +1609,16 @@ static int nvavp_pushbuffer_submit_ioctl(struct file *filp, unsigned int cmd,
 	if (IS_ERR(cmdbuf_dmabuf)) {
 		dev_err(&nvavp->nvhost_dev->dev,
 			"invalid cmd buffer handle %08x\n", hdr.cmdbuf.mem);
+		mutex_unlock(&nvavp->submit_lock);
 		return PTR_ERR(cmdbuf_dmabuf);
+	}
+
+	if ((hdr.cmdbuf.offset & 3)
+		|| (hdr.cmdbuf.offset >= cmdbuf_dmabuf->size)) {
+		dev_err(&nvavp->nvhost_dev->dev,
+			"invalid cmdbuf offset %d\n", hdr.cmdbuf.offset);
+		ret = -EINVAL;
+		goto err_dmabuf_attach;
 	}
 
 	cmdbuf_attach = dma_buf_attach(cmdbuf_dmabuf, &nvavp->nvhost_dev->dev);
@@ -1574,6 +1658,18 @@ static int nvavp_pushbuffer_submit_ioctl(struct file *filp, unsigned int cmd,
 			goto err_reloc_info;
 		}
 
+		if ((clientctx->relocs[i].cmdbuf_offset & 3)
+			|| (clientctx->relocs[i].cmdbuf_offset >=
+				cmdbuf_dmabuf->size)
+			|| (clientctx->relocs[i].cmdbuf_offset >=
+				(cmdbuf_dmabuf->size - hdr.cmdbuf.offset))) {
+			dev_err(&nvavp->nvhost_dev->dev,
+				"invalid reloc offset in cmdbuf %d\n",
+				clientctx->relocs[i].cmdbuf_offset);
+			ret = -EINVAL;
+			goto err_reloc_info;
+		}
+
 		reloc_addr = cmdbuf_data +
 			     (clientctx->relocs[i].cmdbuf_offset >> 2);
 
@@ -1582,6 +1678,17 @@ static int nvavp_pushbuffer_submit_ioctl(struct file *filp, unsigned int cmd,
 			ret = PTR_ERR(target_dmabuf);
 			goto target_dmabuf_fail;
 		}
+
+		if ((clientctx->relocs[i].target_offset & 3)
+			|| (clientctx->relocs[i].target_offset >=
+				target_dmabuf->size)) {
+			dev_err(&nvavp->nvhost_dev->dev,
+				"invalid target offset in reloc %d\n",
+				clientctx->relocs[i].target_offset);
+			ret = -EINVAL;
+			goto target_attach_fail;
+		}
+
 		target_attach = dma_buf_attach(target_dmabuf,
 					       &nvavp->nvhost_dev->dev);
 		if (IS_ERR(target_attach)) {
@@ -1611,6 +1718,10 @@ target_dmabuf_fail:
 			goto err_reloc_info;
 	}
 
+	trace_nvavp_pushbuffer_submit_ioctl(clientctx->channel_id,
+				hdr.cmdbuf.mem, hdr.cmdbuf.offset,
+				hdr.cmdbuf.words, hdr.num_relocs, hdr.flags);
+
 	if (hdr.syncpt) {
 		ret = nvavp_pushbuffer_update(nvavp,
 					     (phys_addr + hdr.cmdbuf.offset),
@@ -1639,6 +1750,7 @@ err_dmabuf_map:
 	dma_buf_detach(cmdbuf_dmabuf, cmdbuf_attach);
 err_dmabuf_attach:
 	dma_buf_put(cmdbuf_dmabuf);
+	mutex_unlock(&nvavp->submit_lock);
 	return ret;
 }
 
@@ -1647,24 +1759,29 @@ static int nvavp_pushbuffer_submit_compat_ioctl(struct file *filp,
 							unsigned int cmd,
 							unsigned long arg)
 {
-	struct nvavp_clientctx *clientctx = filp->private_data;
-	struct nvavp_info *nvavp = clientctx->nvavp;
 	struct nvavp_pushbuffer_submit_hdr_v32 hdr_v32;
 	struct nvavp_pushbuffer_submit_hdr __user *user_hdr;
 	int ret = 0;
+	mutex_lock(&nvavp->submit_lock);
 
 	if (_IOC_DIR(cmd) & _IOC_WRITE) {
 		if (copy_from_user(&hdr_v32, (void __user *)arg,
-			sizeof(struct nvavp_pushbuffer_submit_hdr_v32)))
+			sizeof(struct nvavp_pushbuffer_submit_hdr_v32))) {
+			mutex_unlock(&nvavp->submit_lock);
 			return -EFAULT;
+		}
 	}
 
-	if (!hdr_v32.cmdbuf.mem)
+	if (!hdr_v32.cmdbuf.mem) {
+		mutex_unlock(&nvavp->submit_lock);
 		return 0;
+	}
 
 	user_hdr = compat_alloc_user_space(sizeof(*user_hdr));
-	if (!access_ok(VERIFY_WRITE, user_hdr, sizeof(*user_hdr)))
+	if (!access_ok(VERIFY_WRITE, user_hdr, sizeof(*user_hdr))) {
+		mutex_unlock(&nvavp->submit_lock);
 		return -EFAULT;
+	}
 
 	if (__put_user(hdr_v32.cmdbuf.mem, &user_hdr->cmdbuf.mem)
 	    || __put_user(hdr_v32.cmdbuf.offset, &user_hdr->cmdbuf.offset)
@@ -1674,21 +1791,29 @@ static int nvavp_pushbuffer_submit_compat_ioctl(struct file *filp,
 	    || __put_user(hdr_v32.num_relocs, &user_hdr->num_relocs)
 	    || __put_user((void __user *)(unsigned long)hdr_v32.syncpt,
 			  &user_hdr->syncpt)
-	    || __put_user(hdr_v32.flags, &user_hdr->flags))
+	    || __put_user(hdr_v32.flags, &user_hdr->flags)) {
+		mutex_unlock(&nvavp->submit_lock);
 		return -EFAULT;
+	}
+	mutex_unlock(&nvavp->submit_lock);
 
 	ret = nvavp_pushbuffer_submit_ioctl(filp, cmd, (unsigned long)user_hdr);
 	if (ret)
 		return ret;
 
-	if (__get_user(hdr_v32.syncpt, &user_hdr->syncpt))
+	mutex_lock(&nvavp->submit_lock);
+	if (__get_user(hdr_v32.syncpt, (uintptr_t *)&user_hdr->syncpt))
+	{
+		mutex_unlock(&nvavp->submit_lock);
 		return -EFAULT;
+	}
 
 	if (copy_to_user((void __user *)arg, &hdr_v32,
 			  sizeof(struct nvavp_pushbuffer_submit_hdr_v32))) {
 		ret = -EFAULT;
 	}
 
+	mutex_unlock(&nvavp->submit_lock);
 	return ret;
 }
 #endif
@@ -1747,6 +1872,9 @@ static int nvavp_force_clock_stay_on_ioctl(struct file *filp, unsigned int cmd,
 		return -EINVAL;
 	}
 
+	trace_nvavp_force_clock_stay_on_ioctl(clientctx->channel_id,
+				clock.state, clientctx->clk_reqs);
+
 	if (clock.state) {
 		mutex_lock(&nvavp->open_lock);
 		if (clientctx->clk_reqs++ == 0) {
@@ -1777,6 +1905,8 @@ int nvavp_enable_audio_clocks(nvavp_clientctx_t client, u32 clk_id)
 	dev_dbg(&nvavp->nvhost_dev->dev, "%s: clk_id = %d\n",
 			__func__, clk_id);
 
+	trace_nvavp_enable_audio_clocks(clientctx->channel_id, clk_id);
+
 	mutex_lock(&nvavp->open_lock);
 	if (clk_id == NVAVP_MODULE_ID_VCP)
 		clk_prepare_enable(nvavp->vcp_clk);
@@ -1795,6 +1925,8 @@ int nvavp_disable_audio_clocks(nvavp_clientctx_t client, u32 clk_id)
 	dev_dbg(&nvavp->nvhost_dev->dev, "%s: clk_id = %d\n",
 			__func__, clk_id);
 
+	trace_nvavp_disable_audio_clocks(clientctx->channel_id, clk_id);
+
 	mutex_lock(&nvavp->open_lock);
 	if (clk_id == NVAVP_MODULE_ID_VCP)
 		clk_disable_unprepare(nvavp->vcp_clk);
@@ -1811,7 +1943,7 @@ int nvavp_enable_audio_clocks(nvavp_clientctx_t client, u32 clk_id)
 }
 EXPORT_SYMBOL_GPL(nvavp_enable_audio_clocks);
 
-int nvavp_disable_audio_clocks(nvavp_clientctx_t client, u32_clk_id)
+int nvavp_disable_audio_clocks(nvavp_clientctx_t client, u32 clk_id)
 {
 	return 0;
 }
@@ -1831,6 +1963,9 @@ static int nvavp_set_min_online_cpus_ioctl(struct file *filp, unsigned int cmd,
 
 	dev_dbg(&nvavp->nvhost_dev->dev, "%s: min_online_cpus=%d\n",
 			__func__, config.min_online_cpus);
+
+	trace_nvavp_set_min_online_cpus_ioctl(clientctx->channel_id,
+				config.min_online_cpus);
 
 	if (config.min_online_cpus > 0)
 		pm_qos_update_request(&nvavp->min_online_cpus_req,
@@ -1864,9 +1999,19 @@ static int tegra_nvavp_open(struct nvavp_info *nvavp,
 		nvavp->refcount++;
 		if (IS_VIDEO_CHANNEL_ID(channel_id))
 			nvavp->video_refcnt++;
+#if defined(CONFIG_TEGRA_NVAVP_AUDIO)
 		if (IS_AUDIO_CHANNEL_ID(channel_id))
 			nvavp->audio_refcnt++;
+#endif
 	}
+
+#if defined(CONFIG_TEGRA_NVAVP_AUDIO)
+	trace_tegra_nvavp_open(channel_id, nvavp->refcount,
+				nvavp->video_refcnt, nvavp->audio_refcnt);
+#else
+	trace_tegra_nvavp_open(channel_id, nvavp->refcount,
+				nvavp->video_refcnt, 0);
+#endif
 
 	clientctx->nvavp = nvavp;
 	clientctx->iova_handles = RB_ROOT;
@@ -1950,16 +2095,23 @@ static int tegra_nvavp_release(struct nvavp_clientctx *clientctx,
 
 	if (nvavp->refcount > 0)
 		nvavp->refcount--;
-	if (!nvavp->refcount) {
-		mutex_unlock(&nvavp->open_lock);
+	if (!nvavp->refcount)
 		nvavp_uninit(nvavp);
-		mutex_lock(&nvavp->open_lock);
-	}
 
 	if (IS_VIDEO_CHANNEL_ID(channel_id))
 		nvavp->video_refcnt--;
+#if defined(CONFIG_TEGRA_NVAVP_AUDIO)
 	if (IS_AUDIO_CHANNEL_ID(channel_id))
 		nvavp->audio_refcnt--;
+#endif
+
+#if defined(CONFIG_TEGRA_NVAVP_AUDIO)
+	trace_tegra_nvavp_release(channel_id, nvavp->refcount,
+				nvavp->video_refcnt, nvavp->audio_refcnt);
+#else
+	trace_tegra_nvavp_release(channel_id, nvavp->refcount,
+				nvavp->video_refcnt, 0);
+#endif
 
 out:
 	nvavp_remove_iova_mapping(clientctx);
@@ -1969,9 +2121,16 @@ out:
 
 static int tegra_nvavp_video_release(struct inode *inode, struct file *filp)
 {
-	struct nvavp_clientctx *clientctx = filp->private_data;
-	struct nvavp_info *nvavp = clientctx->nvavp;
+	struct nvavp_clientctx *clientctx;
+	struct nvavp_info *nvavp;
 	int ret = 0;
+
+	clientctx = filp->private_data;
+	if (!clientctx)
+		return ret;
+	nvavp = clientctx->nvavp;
+	if (!nvavp)
+		return ret;
 
 	mutex_lock(&nvavp->open_lock);
 	filp->private_data = NULL;
@@ -1985,9 +2144,16 @@ static int tegra_nvavp_video_release(struct inode *inode, struct file *filp)
 static int tegra_nvavp_audio_release(struct inode *inode,
 					  struct file *filp)
 {
-	struct nvavp_clientctx *clientctx = filp->private_data;
-	struct nvavp_info *nvavp = clientctx->nvavp;
+	struct nvavp_clientctx *clientctx;
+	struct nvavp_info *nvavp;
 	int ret = 0;
+
+	clientctx = filp->private_data;
+	if (!clientctx)
+		return ret;
+	nvavp = clientctx->nvavp;
+	if (!nvavp)
+		return ret;
 
 	mutex_lock(&nvavp->open_lock);
 	filp->private_data = NULL;
@@ -2000,8 +2166,14 @@ static int tegra_nvavp_audio_release(struct inode *inode,
 int tegra_nvavp_audio_client_release(nvavp_clientctx_t client)
 {
 	struct nvavp_clientctx *clientctx = client;
-	struct nvavp_info *nvavp = clientctx->nvavp;
+	struct nvavp_info *nvavp;
 	int ret = 0;
+
+	if (!clientctx)
+		return ret;
+	nvavp = clientctx->nvavp;
+	if (!nvavp)
+		return ret;
 
 	mutex_lock(&nvavp->open_lock);
 	ret = tegra_nvavp_release(clientctx, NVAVP_AUDIO_CHANNEL);
@@ -2044,10 +2216,8 @@ nvavp_channel_open(struct file *filp, struct nvavp_channel_open_args *arg)
 		return err;
 	}
 
-	fd_install(fd, file);
-
-	nonseekable_open(file->f_inode, filp);
 	mutex_lock(&nvavp->open_lock);
+
 	err = tegra_nvavp_open(nvavp,
 		(struct nvavp_clientctx **)&file->private_data,
 		clientctx->channel_id);
@@ -2057,12 +2227,17 @@ nvavp_channel_open(struct file *filp, struct nvavp_channel_open_args *arg)
 		mutex_unlock(&nvavp->open_lock);
 		return err;
 	}
-	mutex_unlock(&nvavp->open_lock);
 
 	arg->channel_fd = fd;
+
+	nonseekable_open(file->f_inode, filp);
+	fd_install(fd, file);
+
+	mutex_unlock(&nvavp->open_lock);
 	return err;
 }
 
+extern struct device tegra_vpr_dev;
 static long tegra_nvavp_ioctl(struct file *filp, unsigned int cmd,
 			    unsigned long arg)
 {
@@ -2070,6 +2245,7 @@ static long tegra_nvavp_ioctl(struct file *filp, unsigned int cmd,
 	struct nvavp_clock_args config;
 	int ret = 0;
 	u8 buf[NVAVP_IOCTL_CHANNEL_MAX_ARG_SIZE];
+	u32 floor_size;
 
 	if (_IOC_TYPE(cmd) != NVAVP_IOCTL_MAGIC ||
 	    _IOC_NR(cmd) < NVAVP_IOCTL_MIN_NR ||
@@ -2127,6 +2303,15 @@ static long tegra_nvavp_ioctl(struct file *filp, unsigned int cmd,
 		if (ret == 0)
 			ret = copy_to_user((void __user *)arg, buf,
 			_IOC_SIZE(cmd));
+		break;
+	case NVAVP_IOCTL_VPR_FLOOR_SIZE:
+		if (copy_from_user(&floor_size, (void __user *)arg,
+			sizeof(floor_size))) {
+			ret = -EFAULT;
+			break;
+		}
+		ret = dma_set_resizable_heap_floor_size(&tegra_vpr_dev,
+				floor_size);
 		break;
 	default:
 		ret = -EINVAL;
@@ -2340,6 +2525,7 @@ static int tegra_nvavp_probe(struct platform_device *ndev)
 
 	nvavp->mbox_from_avp_pend_irq = irq;
 	mutex_init(&nvavp->open_lock);
+	mutex_init(&nvavp->submit_lock);
 
 	for (channel_id = 0; channel_id < NVAVP_NUM_CHANNELS; channel_id++)
 		mutex_init(&nvavp->channel_info[channel_id].pushbuffer_lock);
@@ -2545,6 +2731,8 @@ static int tegra_nvavp_runtime_suspend(struct device *dev)
 	struct nvavp_info *nvavp = platform_get_drvdata(pdev);
 	int ret = 0;
 
+	mutex_lock(&nvavp->open_lock);
+
 	if (nvavp->refcount) {
 		if (!nvavp->clk_enabled) {
 #if defined(CONFIG_TEGRA_NVAVP_AUDIO)
@@ -2560,6 +2748,16 @@ static int tegra_nvavp_runtime_suspend(struct device *dev)
 			ret = -EBUSY;
 		}
 	}
+
+#if defined(CONFIG_TEGRA_NVAVP_AUDIO)
+	trace_tegra_nvavp_runtime_suspend(nvavp->refcount, nvavp->video_refcnt,
+				nvavp->audio_refcnt);
+#else
+	trace_tegra_nvavp_runtime_suspend(nvavp->refcount,
+			nvavp->video_refcnt, 0);
+#endif
+
+	mutex_unlock(&nvavp->open_lock);
 
 	return ret;
 }
@@ -2578,6 +2776,14 @@ static int tegra_nvavp_runtime_resume(struct device *dev)
 		nvavp_init(nvavp, NVAVP_AUDIO_CHANNEL);
 #endif
 
+#if defined(CONFIG_TEGRA_NVAVP_AUDIO)
+	trace_tegra_nvavp_runtime_resume(nvavp->refcount, nvavp->video_refcnt,
+				nvavp->audio_refcnt);
+#else
+	trace_tegra_nvavp_runtime_resume(nvavp->refcount,
+			nvavp->video_refcnt, 0);
+#endif
+
 	mutex_unlock(&nvavp->open_lock);
 
 	return 0;
@@ -2591,7 +2797,14 @@ static int tegra_nvavp_resume(struct device *dev)
 	/* To balance the unpowergate in suspend routine */
 	nvavp_powergate_vde(nvavp);
 
+	nvavp_halt_avp(nvavp);
 	tegra_nvavp_runtime_resume(dev);
+
+#ifdef CONFIG_TRUSTED_LITTLE_KERNEL
+	nvavp_clks_enable(nvavp);
+	te_restore_keyslots();
+	nvavp_clks_disable(nvavp);
+#endif
 
 	return 0;
 }
@@ -2602,20 +2815,14 @@ static int tegra_nvavp_suspend(struct device *dev)
 	struct nvavp_info *nvavp = platform_get_drvdata(pdev);
 	int ret = 0;
 
-	mutex_lock(&nvavp->open_lock);
-
 	ret = tegra_nvavp_runtime_suspend(dev);
-	if (ret) {
-		mutex_unlock(&nvavp->open_lock);
+	if (ret)
 		return ret;
-	}
 
 	/* WAR: Leave partition vde on before suspend so that access
 	 * to BSEV registers immediatly after LP0 exit won't fail.
 	 */
 	nvavp_unpowergate_vde(nvavp);
-
-	mutex_unlock(&nvavp->open_lock);
 
 	return 0;
 }

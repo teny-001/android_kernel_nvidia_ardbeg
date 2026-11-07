@@ -1,7 +1,7 @@
 /*
  * drivers/misc/tegra-profiler/quadd_proc.c
  *
- * Copyright (c) 2014, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2014-2015, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -24,6 +24,7 @@
 #include "quadd.h"
 #include "version.h"
 #include "quadd_proc.h"
+#include "arm_pmu.h"
 
 #define YES_NO(x) ((x) ? "yes" : "no")
 
@@ -55,9 +56,11 @@ static const struct file_operations version_proc_fops = {
 
 static int show_capabilities(struct seq_file *f, void *offset)
 {
+	int cpuid;
 	struct quadd_comm_cap *cap = &ctx->cap;
-	struct quadd_events_cap *event = &cap->events_cap;
 	unsigned int extra = cap->reserved[QUADD_COMM_CAP_IDX_EXTRA];
+	struct quadd_arch_info *arch = NULL;
+
 
 	seq_printf(f, "pmu:                                   %s\n",
 		   YES_NO(cap->pmu));
@@ -65,13 +68,6 @@ static int show_capabilities(struct seq_file *f, void *offset)
 		   YES_NO(cap->tegra_lp_cluster));
 	seq_printf(f, "power rate samples:                    %s\n",
 		   YES_NO(cap->power_rate));
-
-	seq_printf(f, "l2 cache:                              %s\n",
-		   YES_NO(cap->l2_cache));
-	if (cap->l2_cache) {
-		seq_printf(f, "multiple l2 events:             %s\n",
-			   YES_NO(cap->l2_multiple_events));
-	}
 
 	seq_printf(f, "support polling mode:                  %s\n",
 		   YES_NO(cap->blocked_read));
@@ -89,31 +85,63 @@ static int show_capabilities(struct seq_file *f, void *offset)
 		   YES_NO(extra & QUADD_COMM_CAP_EXTRA_SPECIAL_ARCH_MMAP));
 	seq_printf(f, "support mixed unwinding mode:          %s\n",
 		   YES_NO(extra & QUADD_COMM_CAP_EXTRA_UNWIND_MIXED));
+	seq_printf(f, "information about unwind entry:        %s\n",
+		   YES_NO(extra & QUADD_COMM_CAP_EXTRA_UNW_ENTRY_TYPE));
+	seq_printf(f, "arch timer is available:               %s\n",
+		   YES_NO(extra & QUADD_COMM_CAP_EXTRA_ARCH_TIMER));
+	seq_printf(f, "ring buffer mmap operation:            %s\n",
+		   YES_NO(extra & QUADD_COMM_CAP_EXTRA_RB_MMAP_OP));
 
 	seq_puts(f, "\n");
-	seq_puts(f, "Supported events:\n");
-	seq_printf(f, "cpu_cycles:                     %s\n",
-		   YES_NO(event->cpu_cycles));
-	seq_printf(f, "instructions:                   %s\n",
-		   YES_NO(event->instructions));
-	seq_printf(f, "branch_instructions:            %s\n",
-		   YES_NO(event->branch_instructions));
-	seq_printf(f, "branch_misses:                  %s\n",
-		   YES_NO(event->branch_misses));
-	seq_printf(f, "bus_cycles:                     %s\n",
-		   YES_NO(event->bus_cycles));
-	seq_printf(f, "l1_dcache_read_misses:          %s\n",
-		   YES_NO(event->l1_dcache_read_misses));
-	seq_printf(f, "l1_dcache_write_misses:         %s\n",
-		   YES_NO(event->l1_dcache_write_misses));
-	seq_printf(f, "l1_icache_misses:               %s\n",
-		   YES_NO(event->l1_icache_misses));
-	seq_printf(f, "l2_dcache_read_misses:          %s\n",
-		   YES_NO(event->l2_dcache_read_misses));
-	seq_printf(f, "l2_dcache_write_misses:         %s\n",
-		   YES_NO(event->l2_dcache_write_misses));
-	seq_printf(f, "l2_icache_misses:               %s\n",
-		   YES_NO(event->l2_icache_misses));
+
+	if (ctx->pmu) {
+		for_each_possible_cpu(cpuid) {
+			struct quadd_comm_cap_for_cpu *cpu_cap;
+			struct quadd_events_cap *event;
+
+			cpu_cap = ctx->get_capabilities_for_cpu(cpuid);
+			event = &cpu_cap->events_cap;
+
+			arch = ctx->pmu->get_arch(cpuid);
+			seq_printf(f, "\nCPU %d\n", cpuid);
+			if (arch) {
+				seq_printf(f, "pmu arch:                  %s\n",
+						   arch->name);
+				seq_printf(f, "pmu arch version:          %d\n",
+						   arch->ver);
+			}
+			seq_printf(f, "l2 cache:                  %s\n",
+				   YES_NO(cpu_cap->l2_cache));
+			if (cap->l2_cache) {
+				seq_printf(f, "multiple l2 events:        %s\n",
+					   YES_NO(cpu_cap->l2_multiple_events));
+			}
+
+			seq_puts(f, "  Supported events:\n");
+			seq_printf(f, "  cpu_cycles:                     %s\n",
+				   YES_NO(event->cpu_cycles));
+			seq_printf(f, "  instructions:                   %s\n",
+				   YES_NO(event->instructions));
+			seq_printf(f, "  branch_instructions:            %s\n",
+				   YES_NO(event->branch_instructions));
+			seq_printf(f, "  branch_misses:                  %s\n",
+				   YES_NO(event->branch_misses));
+			seq_printf(f, "  bus_cycles:                     %s\n",
+				   YES_NO(event->bus_cycles));
+			seq_printf(f, "  l1_dcache_read_misses:          %s\n",
+				   YES_NO(event->l1_dcache_read_misses));
+			seq_printf(f, "  l1_dcache_write_misses:         %s\n",
+				   YES_NO(event->l1_dcache_write_misses));
+			seq_printf(f, "  l1_icache_misses:               %s\n",
+				   YES_NO(event->l1_icache_misses));
+			seq_printf(f, "  l2_dcache_read_misses:          %s\n",
+				   YES_NO(event->l2_dcache_read_misses));
+			seq_printf(f, "  l2_dcache_write_misses:         %s\n",
+				   YES_NO(event->l2_dcache_write_misses));
+			seq_printf(f, "  l2_icache_misses:               %s\n",
+				   YES_NO(event->l2_icache_misses));
+		}
+	}
 
 	return 0;
 }

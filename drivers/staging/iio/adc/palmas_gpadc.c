@@ -106,7 +106,6 @@ struct palmas_gpadc {
 	struct dentry			*dentry;
 	bool is_shutdown;
 	struct mutex lock;
-	bool isr_done;
 };
 
 /*
@@ -168,7 +167,6 @@ static irqreturn_t palmas_gpadc_irq(int irq, void *data)
 {
 	struct palmas_gpadc *adc = data;
 
-	adc->isr_done = true;
 	complete(&adc->conv_completion);
 	return IRQ_HANDLED;
 }
@@ -539,23 +537,8 @@ static int palmas_gpadc_start_convertion(struct palmas_gpadc *adc, int adc_chan)
 {
 	unsigned int val;
 	int ret;
-	unsigned int timeout = 10;
 
-	adc->isr_done = false;
 	INIT_COMPLETION(adc->conv_completion);
-	ret = palmas_read(adc->palmas, PALMAS_GPADC_BASE,
-				PALMAS_GPADC_STATUS, &val);
-	if (ret < 0) {
-		dev_err(adc->dev, "GPADC_STATUS read failed: %d\n",
-			ret);
-		return ret;
-	}
-	if (!(val & PALMAS_GPADC_STATUS_GPADC_AVAILABLE)) {
-		dev_err(adc->dev, "ADC is already busy STATUS = 0x%02x\n",
-				val);
-		return -EBUSY;
-	}
-
 	ret = palmas_update_bits(adc->palmas, PALMAS_GPADC_BASE,
 				PALMAS_GPADC_SW_SELECT,
 				PALMAS_GPADC_SW_SELECT_SW_START_CONV0,
@@ -565,34 +548,10 @@ static int palmas_gpadc_start_convertion(struct palmas_gpadc *adc, int adc_chan)
 		return ret;
 	}
 
-	while (timeout--) {
-		usleep_range(500, 600);
-		ret = palmas_read(adc->palmas, PALMAS_GPADC_BASE,
-				PALMAS_GPADC_STATUS, &val);
-		if (ret < 0) {
-			dev_err(adc->dev, "GPADC_STATUS read failed: %d\n",
-				ret);
-			return ret;
-		}
-		if (val & PALMAS_GPADC_STATUS_GPADC_AVAILABLE)
-			break;
-	}
-
-	if (timeout == 0) {
+	ret = wait_for_completion_timeout(&adc->conv_completion,
+				ADC_CONVERTION_TIMEOUT);
+	if (ret == 0) {
 		dev_err(adc->dev, "ADC conversion not completed\n");
-		dev_err(adc->dev, "Channel %d ISR status %d\n", adc_chan, adc->isr_done);
-		ret = palmas_read(adc->palmas, PALMAS_GPADC_BASE,
-				PALMAS_GPADC_STATUS, &val);
-		dev_err(adc->dev, "GPADC_STATUS read st %d and val 0x%02x\n", ret, val);
-		ret = palmas_read(adc->palmas, PALMAS_GPADC_BASE,
-				PALMAS_GPADC_SW_SELECT, &val);
-		dev_err(adc->dev, "GPADC_SW_SELECT read st %d and val 0x%02x\n", ret, val);
-		ret = palmas_read(adc->palmas, PALMAS_GPADC_BASE,
-				PALMAS_GPADC_AUTO_CTRL, &val);
-		dev_err(adc->dev, "GPADC_AUTO_CTRL read st %d and val 0x%02x\n", ret, val);
-		ret = palmas_read(adc->palmas, PALMAS_GPADC_BASE,
-				PALMAS_GPADC_RT_CTRL, &val);
-		dev_err(adc->dev, "GPADC_RT_CTRL read st %d and val 0x%02x\n", ret, val);
 		ret = -ETIMEDOUT;
 		goto error;
 	}
@@ -1050,13 +1009,9 @@ static int palmas_gpadc_get_adc_dt_data(struct platform_device *pdev,
 {
 	struct device_node *np = pdev->dev.of_node;
 	struct palmas_gpadc_platform_data *gp_data;
-	struct device_node *map_node;
-	struct device_node *child;
-	struct iio_map *palmas_iio_map;
 	struct palmas_adc_auto_conv_property *conv_prop;
 	int ret;
 	u32 pval;
-	int nmap, nvalid_map;
 
 	gp_data = devm_kzalloc(&pdev->dev, sizeof(*gp_data), GFP_KERNEL);
 	if (!gp_data)
@@ -1090,47 +1045,6 @@ static int palmas_gpadc_get_adc_dt_data(struct platform_device *pdev,
 	if (!ret)
 		gp_data->adc_auto_conv1_data = conv_prop;
 
-	map_node = of_get_child_by_name(np, "iio_map");
-	if (!map_node) {
-		dev_warn(&pdev->dev, "IIO map table not found\n");
-		goto done;
-	}
-
-	nmap = of_get_child_count(map_node);
-	if (!nmap)
-		goto done;
-
-	nmap++;
-	palmas_iio_map = devm_kzalloc(&pdev->dev,
-				sizeof(*palmas_iio_map) * nmap, GFP_KERNEL);
-	if (!palmas_iio_map)
-		goto done;
-
-	nvalid_map = 0;
-	for_each_child_of_node(map_node, child) {
-		ret = of_property_read_u32(child, "ti,adc-channel-number",
-					&pval);
-		if (!ret && pval < ARRAY_SIZE(palmas_gpadc_iio_channel))
-			palmas_iio_map[nvalid_map].adc_channel_label =
-				palmas_gpadc_iio_channel[pval].datasheet_name;
-		of_property_read_string(child, "ti,adc-consumer-device",
-				&palmas_iio_map[nvalid_map].consumer_dev_name);
-		of_property_read_string(child, "ti,adc-consumer-channel",
-				&palmas_iio_map[nvalid_map].consumer_channel);
-		dev_dbg(&pdev->dev,
-			"Channel %s consumer dev %s and consumer channel %s\n",
-				palmas_iio_map[nvalid_map].adc_channel_label,
-				palmas_iio_map[nvalid_map].consumer_dev_name,
-				palmas_iio_map[nvalid_map].consumer_channel);
-		nvalid_map++;
-	}
-	palmas_iio_map[nvalid_map].adc_channel_label = NULL;
-	palmas_iio_map[nvalid_map].consumer_dev_name = NULL;
-	palmas_iio_map[nvalid_map].consumer_channel = NULL;
-
-	gp_data->iio_maps = palmas_iio_map;
-
-done:
 	*gpadc_pdata = gp_data;
 	return 0;
 }

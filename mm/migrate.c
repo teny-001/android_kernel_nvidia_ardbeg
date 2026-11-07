@@ -30,12 +30,15 @@
 #include <linux/mempolicy.h>
 #include <linux/vmalloc.h>
 #include <linux/security.h>
+#include <linux/backing-dev.h>
 #include <linux/memcontrol.h>
 #include <linux/syscalls.h>
 #include <linux/hugetlb.h>
 #include <linux/hugetlb_cgroup.h>
 #include <linux/gfp.h>
 #include <linux/balloon_compaction.h>
+#include <linux/dma-contiguous.h>
+#include <linux/mmu_notifier.h>
 
 #include <asm/tlbflush.h>
 
@@ -218,18 +221,31 @@ static void __migration_entry_wait(struct mm_struct *mm, pte_t *ptep,
 
 	page = migration_entry_to_page(entry);
 
-	/*
-	 * Once radix-tree replacement of page migration started, page_count
-	 * *must* be zero. And, we don't want to call wait_on_page_locked()
-	 * against a page without get_page().
-	 * So, we use get_page_unless_zero(), here. Even failed, page fault
-	 * will occur again.
-	 */
-	if (!get_page_unless_zero(page))
-		goto out;
-	pte_unmap_unlock(ptep, ptl);
-	wait_on_page_locked(page);
-	put_page(page);
+	if (dma_contiguous_should_replace_page(page)) {
+		pte_unmap_unlock(ptep, ptl);
+		/* don't take ref on page, as it causes
+		 * migration to get aborted in between.
+		 * migration goes ahead after locking the page.
+		 * Wait on page to be unlocked. In case page get
+		 * unlocked, allocated and locked again forever,
+		 * before this function call, it would timeout in
+		 * next tick and exit.
+		 */
+		wait_on_page_locked_timeout(page);
+	} else {
+		/*
+		 * Once radix-tree replacement of page migration started, page_count
+		 * *must* be zero. And, we don't want to call wait_on_page_locked()
+		 * against a page without get_page().
+		 * So, we use get_page_unless_zero(), here. Even failed, page fault
+		 * will occur again.
+		 */
+		if (!get_page_unless_zero(page))
+			goto out;
+		pte_unmap_unlock(ptep, ptl);
+		wait_on_page_locked(page);
+		put_page(page);
+	}
 	return;
 out:
 	pte_unmap_unlock(ptep, ptl);
@@ -311,6 +327,8 @@ static int migrate_page_move_mapping(struct address_space *mapping,
 		struct page *newpage, struct page *page,
 		struct buffer_head *head, enum migrate_mode mode)
 {
+	struct zone *oldzone, *newzone;
+	int dirty;
 	int expected_count = 0;
 	void **pslot;
 
@@ -320,6 +338,9 @@ static int migrate_page_move_mapping(struct address_space *mapping,
 			return -EAGAIN;
 		return MIGRATEPAGE_SUCCESS;
 	}
+
+	oldzone = page_zone(page);
+	newzone = page_zone(newpage);
 
 	spin_lock_irq(&mapping->tree_lock);
 
@@ -361,6 +382,13 @@ static int migrate_page_move_mapping(struct address_space *mapping,
 		set_page_private(newpage, page_private(page));
 	}
 
+	/* Move dirty while page refs frozen and newpage not yet exposed */
+	dirty = PageDirty(page);
+	if (dirty) {
+		ClearPageDirty(page);
+		SetPageDirty(newpage);
+	}
+
 	radix_tree_replace_slot(pslot, newpage);
 
 	/*
@@ -369,6 +397,9 @@ static int migrate_page_move_mapping(struct address_space *mapping,
 	 * We know this isn't the last reference.
 	 */
 	page_unfreeze_refs(page, expected_count - 1);
+
+	spin_unlock(&mapping->tree_lock);
+	/* Leave irq disabled to prevent preemption while updating stats */
 
 	/*
 	 * If moved to a different zone then also account
@@ -380,13 +411,19 @@ static int migrate_page_move_mapping(struct address_space *mapping,
 	 * via NR_FILE_PAGES and NR_ANON_PAGES if they
 	 * are mapped to swap space.
 	 */
-	__dec_zone_page_state(page, NR_FILE_PAGES);
-	__inc_zone_page_state(newpage, NR_FILE_PAGES);
-	if (!PageSwapCache(page) && PageSwapBacked(page)) {
-		__dec_zone_page_state(page, NR_SHMEM);
-		__inc_zone_page_state(newpage, NR_SHMEM);
+	if (newzone != oldzone) {
+		__dec_zone_state(oldzone, NR_FILE_PAGES);
+		__inc_zone_state(newzone, NR_FILE_PAGES);
+		if (PageSwapBacked(page) && !PageSwapCache(page)) {
+			__dec_zone_state(oldzone, NR_SHMEM);
+			__inc_zone_state(newzone, NR_SHMEM);
+		}
+		if (dirty && mapping_cap_account_dirty(mapping)) {
+			__dec_zone_state(oldzone, NR_FILE_DIRTY);
+			__inc_zone_state(newzone, NR_FILE_DIRTY);
+		}
 	}
-	spin_unlock_irq(&mapping->tree_lock);
+	local_irq_enable();
 
 	return MIGRATEPAGE_SUCCESS;
 }
@@ -460,20 +497,9 @@ void migrate_page_copy(struct page *newpage, struct page *page)
 	if (PageMappedToDisk(page))
 		SetPageMappedToDisk(newpage);
 
-	if (PageDirty(page)) {
-		clear_page_dirty_for_io(page);
-		/*
-		 * Want to mark the page and the radix tree as dirty, and
-		 * redo the accounting that clear_page_dirty_for_io undid,
-		 * but we can't use set_page_dirty because that function
-		 * is actually a signal that all of the page has become dirty.
-		 * Whereas only part of our page may be dirty.
-		 */
-		if (PageSwapBacked(page))
-			SetPageDirty(newpage);
-		else
-			__set_page_dirty_nobuffers(newpage);
- 	}
+	/* Move dirty on pages not done by migrate_page_move_mapping() */
+	if (PageDirty(page))
+		SetPageDirty(newpage);
 
 	mlock_migrate_page(newpage, page);
 	ksm_migrate_page(newpage, page);
@@ -1084,6 +1110,59 @@ out:
 	return rc;
 }
 
+/*
+ * migrate_replace_page
+ *
+ * The function takes one single page and a target page (newpage) and
+ * tries to migrate data to the target page. The caller must ensure that
+ * the source page is locked with one additional get_page() call, which
+ * will be freed during the migration. The caller also must release newpage
+ * if migration fails, otherwise the ownership of the newpage is taken.
+ * Source page is released if migration succeeds.
+ *
+ * Return: error code or 0 on success.
+ */
+int migrate_replace_page(struct page *page, struct page *newpage)
+{
+	struct zone *zone = page_zone(page);
+	unsigned long flags;
+	int ret = -EAGAIN;
+	int pass;
+
+	migrate_prep();
+
+	spin_lock_irqsave(&zone->lru_lock, flags);
+
+	if (PageLRU(page) &&
+	    __isolate_lru_page(page, ISOLATE_UNEVICTABLE) == 0) {
+		struct lruvec *lruvec = mem_cgroup_page_lruvec(page, zone);
+		del_page_from_lru_list(page, lruvec, page_lru(page));
+		spin_unlock_irqrestore(&zone->lru_lock, flags);
+	} else {
+		spin_unlock_irqrestore(&zone->lru_lock, flags);
+		return -EAGAIN;
+	}
+
+	for (pass = 0; pass < 10 && ret != 0; pass++) {
+		cond_resched();
+
+		if (page_count(page) == 1) {
+			/* page was freed from under us, so we are done */
+			ret = 0;
+			break;
+		}
+		ret = __unmap_and_move(page, newpage, 1, MIGRATE_SYNC);
+	}
+
+	if (ret == 0) {
+		/* take ownership of newpage and add it to lru */
+		putback_lru_page(newpage);
+	}
+
+	putback_lru_page(page);
+	return ret;
+}
+
 #ifdef CONFIG_NUMA
 /*
  * Move a list of individual pages
@@ -1650,12 +1729,13 @@ int migrate_misplaced_transhuge_page(struct mm_struct *mm,
 				unsigned long address,
 				struct page *page, int node)
 {
-	unsigned long haddr = address & HPAGE_PMD_MASK;
 	pg_data_t *pgdat = NODE_DATA(node);
 	int isolated = 0;
 	struct page *new_page = NULL;
 	struct mem_cgroup *memcg = NULL;
 	int page_lru = page_is_file_cache(page);
+	unsigned long mmun_start = address & HPAGE_PMD_MASK;
+	unsigned long mmun_end = mmun_start + HPAGE_PMD_SIZE;
 
 	/*
 	 * Don't migrate pages that are mapped in multiple processes.
@@ -1696,9 +1776,13 @@ int migrate_misplaced_transhuge_page(struct mm_struct *mm,
 	WARN_ON(PageLRU(new_page));
 
 	/* Recheck the target PMD */
+	mmu_notifier_invalidate_range_start(vma, mmun_start,
+					    mmun_end, MMU_MIGRATE);
 	spin_lock(&mm->page_table_lock);
 	if (unlikely(!pmd_same(*pmd, entry))) {
 		spin_unlock(&mm->page_table_lock);
+		mmu_notifier_invalidate_range_end(vma, mmun_start,
+						  mmun_end, MMU_MIGRATE);
 
 		/* Reverse changes made by migrate_page_copy() */
 		if (TestClearPageActive(new_page))
@@ -1733,9 +1817,9 @@ int migrate_misplaced_transhuge_page(struct mm_struct *mm,
 	entry = maybe_pmd_mkwrite(pmd_mkdirty(entry), vma);
 	entry = pmd_mkhuge(entry);
 
-	pmdp_clear_flush(vma, haddr, pmd);
-	set_pmd_at(mm, haddr, pmd, entry);
-	page_add_new_anon_rmap(new_page, vma, haddr);
+	pmdp_clear_flush(vma, mmun_start, pmd);
+	set_pmd_at(mm, mmun_start, pmd, entry);
+	page_add_new_anon_rmap(new_page, vma, mmun_start);
 	update_mmu_cache_pmd(vma, address, &entry);
 	page_remove_rmap(page);
 	/*
@@ -1745,6 +1829,8 @@ int migrate_misplaced_transhuge_page(struct mm_struct *mm,
 	 */
 	mem_cgroup_end_migration(memcg, page, new_page, true);
 	spin_unlock(&mm->page_table_lock);
+	mmu_notifier_invalidate_range_end(vma, mmun_start,
+					  mmun_end, MMU_MIGRATE);
 
 	unlock_page(new_page);
 	unlock_page(page);
@@ -1763,7 +1849,7 @@ out_fail:
 	count_vm_events(PGMIGRATE_FAIL, HPAGE_PMD_NR);
 out_dropref:
 	entry = pmd_mknonnuma(entry);
-	set_pmd_at(mm, haddr, pmd, entry);
+	set_pmd_at(mm, mmun_start, pmd, entry);
 	update_mmu_cache_pmd(vma, address, &entry);
 
 out_unlock:

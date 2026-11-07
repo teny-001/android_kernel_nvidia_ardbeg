@@ -37,7 +37,7 @@
  *		as published by the Free Software Foundation; either version
  *		2 of the License, or (at your option) any later version.
  *
- * Copyright (c) 2013, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2013-2016, NVIDIA CORPORATION.  All rights reserved.
  */
 #ifndef _SOCK_H
 #define _SOCK_H
@@ -354,6 +354,7 @@ struct sock {
 				sk_no_check  : 2,
 				sk_userlocks : 4,
 				sk_protocol  : 8,
+#define SK_PROTOCOL_MAX U8_MAX
 				sk_type      : 16;
 	kmemcheck_bitfield_end(flags);
 	int			sk_wmem_queued;
@@ -674,6 +675,8 @@ enum sock_flags {
 	SOCK_SELECT_ERR_QUEUE, /* Wake select on error queue */
 };
 
+#define SK_FLAGS_TIMESTAMP ((1UL << SOCK_TIMESTAMP) | (1UL << SOCK_TIMESTAMPING_RX_SOFTWARE))
+
 static inline void sock_copy_flags(struct sock *nsk, struct sock *osk)
 {
 	nsk->sk_flags = osk->sk_flags;
@@ -783,6 +786,14 @@ static inline __must_check int sk_add_backlog(struct sock *sk, struct sk_buff *s
 {
 	if (sk_rcvqueues_full(sk, skb, limit))
 		return -ENOBUFS;
+
+	/*
+	 * If the skb was allocated from pfmemalloc reserves, only
+	 * allow SOCK_MEMALLOC sockets to use it as this socket is
+	 * helping free memory
+	 */
+	if (skb_pfmemalloc(skb) && !sock_flag(sk, SOCK_MEMALLOC))
+		return -ENOMEM;
 
 	__sk_add_backlog(sk, skb);
 	sk->sk_backlog.len += skb->truesize;
@@ -934,7 +945,6 @@ struct proto {
 						struct sk_buff *skb);
 
 	void		(*release_cb)(struct sock *sk);
-	void		(*mtu_reduced)(struct sock *sk);
 
 	/* Keeping track of sk's, looking them up, and port selection methods. */
 	void			(*hash)(struct sock *sk);
@@ -1000,6 +1010,7 @@ struct proto {
 	void			(*destroy_cgroup)(struct mem_cgroup *memcg);
 	struct cg_proto		*(*proto_cgroup)(struct mem_cgroup *memcg);
 #endif
+	int			(*diag_destroy)(struct sock *sk, int err);
 };
 
 /*
@@ -1439,6 +1450,11 @@ static inline void sk_wmem_free_skb(struct sock *sk, struct sk_buff *skb)
  */
 #define sock_owned_by_user(sk)	((sk)->sk_lock.owned)
 
+static inline void sock_release_ownership(struct sock *sk)
+{
+	sk->sk_lock.owned = 0;
+}
+
 /*
  * Macro so as to not evaluate some arguments when
  * lockdep is not enabled.
@@ -1584,8 +1600,6 @@ extern int compat_sock_common_setsockopt(struct socket *sock, int level,
 
 extern void sk_common_release(struct sock *sk);
 
-extern char *sk_get_waiting_task_cmdline(struct sock *sk, char *cmdline);
-
 /*
  *	Default socket callbacks and setup code
  */
@@ -1726,8 +1740,8 @@ sk_dst_get(struct sock *sk)
 
 	rcu_read_lock();
 	dst = rcu_dereference(sk->sk_dst_cache);
-	if (dst)
-		dst_hold(dst);
+	if (dst && !atomic_inc_not_zero(&dst->__refcnt))
+		dst = NULL;
 	rcu_read_unlock();
 	return dst;
 }
@@ -1766,9 +1780,11 @@ __sk_dst_set(struct sock *sk, struct dst_entry *dst)
 static inline void
 sk_dst_set(struct sock *sk, struct dst_entry *dst)
 {
-	spin_lock(&sk->sk_dst_lock);
-	__sk_dst_set(sk, dst);
-	spin_unlock(&sk->sk_dst_lock);
+	struct dst_entry *old_dst;
+
+	sk_tx_queue_clear(sk);
+	old_dst = xchg((__force struct dst_entry **)&sk->sk_dst_cache, dst);
+	dst_release(old_dst);
 }
 
 static inline void
@@ -1780,9 +1796,7 @@ __sk_dst_reset(struct sock *sk)
 static inline void
 sk_dst_reset(struct sock *sk)
 {
-	spin_lock(&sk->sk_dst_lock);
-	__sk_dst_reset(sk);
-	spin_unlock(&sk->sk_dst_lock);
+	sk_dst_set(sk, NULL);
 }
 
 extern struct dst_entry *__sk_dst_check(struct sock *sk, u32 cookie);
@@ -2246,6 +2260,11 @@ static inline struct sock *skb_steal_sock(struct sk_buff *skb)
 extern void sock_enable_timestamp(struct sock *sk, int flag);
 extern int sock_get_timestamp(struct sock *, struct timeval __user *);
 extern int sock_get_timestampns(struct sock *, struct timespec __user *);
+
+bool sk_ns_capable(const struct sock *sk,
+		   struct user_namespace *user_ns, int cap);
+bool sk_capable(const struct sock *sk, int cap);
+bool sk_net_capable(const struct sock *sk, int cap);
 
 /*
  *	Enable debug/info messages

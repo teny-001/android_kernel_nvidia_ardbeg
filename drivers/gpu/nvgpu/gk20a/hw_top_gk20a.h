@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2013, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2012-2015, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -74,10 +74,6 @@ static inline u32 top_num_fbps_value_v(u32 r)
 {
 	return (r >> 0) & 0x1f;
 }
-static inline u32 top_fs_status_r(void)
-{
-	return 0x00022500;
-}
 static inline u32 top_device_info_r(u32 i)
 {
 	return 0x00022700 + i*4;
@@ -101,6 +97,14 @@ static inline u32 top_device_info_engine_enum_v(u32 r)
 static inline u32 top_device_info_runlist_enum_v(u32 r)
 {
 	return (r >> 21) & 0xf;
+}
+static inline u32 top_device_info_intr_enum_v(u32 r)
+{
+	return (r >> 15) & 0x1f;
+}
+static inline u32 top_device_info_reset_enum_v(u32 r)
+{
+	return (r >> 9) & 0x1f;
 }
 static inline u32 top_device_info_type_enum_v(u32 r)
 {
@@ -133,5 +137,29 @@ static inline u32 top_device_info_entry_not_valid_v(void)
 static inline u32 top_device_info_entry_enum_v(void)
 {
 	return 0x00000002;
+}
+static inline u32 top_fs_status_fbp_r(void)
+{
+	return 0x00022548;
+}
+static inline u32 top_fs_status_fbp_cluster_v(u32 r)
+{
+	return (r >> 0) & 0xffff;
+}
+static inline u32 top_fs_status_fbp_cluster_enable_v(void)
+{
+	return 0x00000000;
+}
+static inline u32 top_fs_status_fbp_cluster_enable_f(void)
+{
+	return 0x0;
+}
+static inline u32 top_fs_status_fbp_cluster_disable_v(void)
+{
+	return 0x00000001;
+}
+static inline u32 top_fs_status_fbp_cluster_disable_f(void)
+{
+	return 0x1;
 }
 #endif

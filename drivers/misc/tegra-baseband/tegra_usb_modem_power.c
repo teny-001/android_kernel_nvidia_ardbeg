@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011-2014, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2011-2017, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -23,6 +23,9 @@
 #include <linux/platform_data/tegra_usb.h>
 #include <linux/workqueue.h>
 #include <linux/gpio.h>
+#include <linux/of.h>
+#include <linux/of_device.h>
+#include <linux/of_gpio.h>
 #include <linux/usb.h>
 #include <linux/err.h>
 #include <linux/pm_runtime.h>
@@ -32,8 +35,21 @@
 #include <linux/pm_qos.h>
 #include <linux/regulator/consumer.h>
 #include <linux/sysedp.h>
-#include <mach/gpio-tegra.h>
 #include <linux/platform_data/tegra_usb_modem_power.h>
+#include <linux/delay.h>
+#include <linux/fs.h>
+#include <asm/segment.h>
+#include <asm/uaccess.h>
+#include <linux/platform_data/modem_thermal.h>
+#include <linux/platform_data/sysedp_modem.h>
+#include <linux/system-wakeup.h>
+
+#if defined(CONFIG_ARCH_TEGRA_21x_SOC)
+#include <linux/of_platform.h>
+#else
+#include <linux/dma-mapping.h>
+#include "../../../arch/arm/mach-tegra/iomap.h"
+#endif
 
 #define BOOST_CPU_FREQ_MIN	1200000
 #define BOOST_CPU_FREQ_TIMEOUT	5000
@@ -42,6 +58,79 @@
 #define WAKELOCK_TIMEOUT_FOR_REMOTE_WAKE	(HZ)
 
 #define MAX_MODEM_EDP_STATES 10
+
+/* default autosuspend delay in ms */
+#define DEFAULT_AUTOSUSPEND		2000
+
+#define XHCI_HSIC_POWER "/sys/bus/platform/devices/tegra-xhci/hsic0_power"
+
+static int hsic_power(bool on)
+{
+	struct file *fp = NULL;
+	mm_segment_t oldfs;
+	loff_t offset = 0;
+
+	oldfs = get_fs();
+	set_fs(get_ds());
+	fp = filp_open(XHCI_HSIC_POWER, O_RDWR, S_IRWXU);
+	if (IS_ERR(fp)) {
+		pr_err("%s: error opening %s, error:%ld\n",
+				__func__, XHCI_HSIC_POWER, PTR_ERR(fp));
+		return PTR_ERR(fp);
+	}
+
+	if (on)
+		vfs_write(fp, "1", 1, &offset);
+	else
+		vfs_write(fp, "0", 1, &offset);
+
+	vfs_fsync(fp, 0);
+	set_fs(oldfs);
+	filp_close(fp, NULL);
+	return 0;
+}
+
+#ifndef CONFIG_ARCH_TEGRA_21x_SOC
+static u64 tegra_ehci_dmamask = DMA_BIT_MASK(64);
+
+static struct resource tegra_usb2_resources[] = {
+	[0] = {
+		.start  = TEGRA_USB2_BASE,
+		.end    = TEGRA_USB2_BASE + TEGRA_USB2_SIZE - 1,
+		.flags  = IORESOURCE_MEM,
+	},
+	[1] = {
+		.start  = INT_USB2,
+		.end    = INT_USB2,
+		.flags  = IORESOURCE_IRQ,
+	},
+};
+
+static struct platform_device tegra_ehci2_device = {
+	.name   = "tegra-ehci",
+	.id     = 1,
+	.dev    = {
+		.dma_mask       = &tegra_ehci_dmamask,
+		.coherent_dma_mask = DMA_BIT_MASK(64),
+	},
+	.resource = tegra_usb2_resources,
+	.num_resources = ARRAY_SIZE(tegra_usb2_resources),
+};
+
+static struct tegra_usb_platform_data tegra_ehci2_hsic_baseband_pdata = {
+	.port_otg = false,
+	.has_hostpc = true,
+	.unaligned_dma_buf_supported = false,
+	.phy_intf = TEGRA_USB_PHY_INTF_HSIC,
+	.op_mode = TEGRA_USB_OPMODE_HOST,
+	.u_data.host = {
+		.hot_plug = false,
+		.remote_wakeup_supported = true,
+		.power_off_on_suspend = true,
+		.skip_resume = true,
+	},
+};
+#endif
 
 struct tegra_usb_modem {
 	struct tegra_usb_modem_power_platform_data *pdata;
@@ -56,11 +145,14 @@ struct tegra_usb_modem {
 	struct wake_lock wake_lock;	/* modem wake lock */
 	unsigned int vid;	/* modem vendor id */
 	unsigned int pid;	/* modem product id */
+	struct usb_device *xusb_roothub;	/* XUSB roothub device */
 	struct usb_device *udev;	/* modem usb device */
 	struct usb_device *parent;	/* parent device */
 	struct usb_interface *intf;	/* first modem usb interface */
 	struct workqueue_struct *wq;	/* modem workqueue */
 	struct delayed_work recovery_work;	/* modem recovery work */
+	struct delayed_work enable_nvhsic_work; /* enable xhci hsic work */
+	bool nvhsic_work_queued;	/* if hsic power work is queued*/
 	struct work_struct host_load_work;	/* usb host load work */
 	struct work_struct host_unload_work;	/* usb host unload work */
 	struct pm_qos_request cpu_boost_req; /* min CPU freq request */
@@ -72,32 +164,35 @@ struct tegra_usb_modem {
 	struct notifier_block pm_notifier;	/* pm event notifier */
 	struct notifier_block usb_notifier;	/* usb event notifier */
 	int sysfs_file_created;
-	int short_autosuspend_enabled;
 	struct platform_device *hc;	/* USB host controller */
 	struct mutex hc_lock;
-	struct mutex sysedp_lock;
-	unsigned int mdm_power_irq;	/* modem power increase irq */
-	bool mdm_power_irq_wakeable;	/* not used for LP0 wakeup */
-	int sysedp_prev_request;	/* previous modem request */
-	int sysedp_file_created;	/* sysedp state file created */
+	enum { EHCI_HSIC = 0, XHCI_HSIC, XHCI_UTMI } phy_type;
+	struct platform_device *modem_thermal_pdev;
+	int pre_boost_gpio;		/* control regulator output voltage */
+	int modem_state_file_created;	/* modem_state sysfs created */
+	enum { AIRPLANE = 0, RAT_3G_LTE, RAT_2G} modem_power_state;
+	struct mutex modem_state_lock;
+	struct platform_device *modem_edp_pdev;
+	bool boot_gpio_changed; /* state changed during suspend */
 };
 
 
 /* supported modems */
 static const struct usb_device_id modem_list[] = {
 	{USB_DEVICE(0x1983, 0x0310),	/* Icera 450 rev1 */
-	 .driver_info = TEGRA_MODEM_AUTOSUSPEND,
+	 .driver_info = TEGRA_MODEM_AUTOSUSPEND | TEGRA_MODEM_CPU_BOOST,
 	 },
 	{USB_DEVICE(0x1983, 0x0321),	/* Icera 450 rev2 */
-	 .driver_info = TEGRA_MODEM_AUTOSUSPEND,
+	 .driver_info = TEGRA_MODEM_AUTOSUSPEND | TEGRA_MODEM_CPU_BOOST,
 	 },
 	{USB_DEVICE(0x1983, 0x0327),	/* Icera 450 5AE */
-	 .driver_info = TEGRA_MODEM_AUTOSUSPEND,
+	 .driver_info = TEGRA_MODEM_AUTOSUSPEND | TEGRA_MODEM_CPU_BOOST,
 	 },
 	{USB_DEVICE(0x1983, 0x0427),	/* Icera 500 5AN */
-	 .driver_info = TEGRA_MODEM_AUTOSUSPEND,
+	 .driver_info = TEGRA_MODEM_AUTOSUSPEND | TEGRA_MODEM_CPU_BOOST,
 	 },
 	{USB_DEVICE(0x1983, 0x1005),	/* Icera 500 5AN (BSD) */
+	 .driver_info = TEGRA_MODEM_CPU_BOOST,
 	/* .driver_info = TEGRA_MODEM_AUTOSUSPEND, */
 	 },
 	{USB_DEVICE(0x1983, 0x1007),	/* Icera 500 Bruce */
@@ -135,9 +230,6 @@ static irqreturn_t tegra_usb_modem_wake_thread(int irq, void *data)
 
 	mutex_lock(&modem->lock);
 	if (modem->udev && modem->udev->state != USB_STATE_NOTATTACHED) {
-		wake_lock_timeout(&modem->wake_lock,
-				  WAKELOCK_TIMEOUT_FOR_REMOTE_WAKE);
-
 		dev_info(&modem->pdev->dev, "remote wake (%u)\n",
 			 ++(modem->wake_cnt));
 
@@ -147,58 +239,11 @@ static irqreturn_t tegra_usb_modem_wake_thread(int irq, void *data)
 				usb_autopm_put_interface_async(modem->intf);
 			usb_unlock_device(modem->udev);
 		}
-#ifdef CONFIG_PM
-		if (modem->capability & TEGRA_MODEM_AUTOSUSPEND &&
-		    modem->short_autosuspend_enabled) {
-			pm_runtime_set_autosuspend_delay(&modem->udev->dev,
-					modem->pdata->autosuspend_delay);
-			modem->short_autosuspend_enabled = 0;
-		}
-#endif
 	}
 	mutex_unlock(&modem->lock);
 
 	return IRQ_HANDLED;
 }
-static irqreturn_t tegra_usb_modem_sysedp_thread(int irq, void *data)
-{
-	struct tegra_usb_modem *modem = (struct tegra_usb_modem *)data;
-
-	mutex_lock(&modem->sysedp_lock);
-	if (gpio_get_value(modem->pdata->mdm_power_report_gpio))
-		sysedp_set_state_by_name("icemdm", 0);
-	else
-		sysedp_set_state_by_name("icemdm", modem->sysedp_prev_request);
-	mutex_unlock(&modem->sysedp_lock);
-
-	return IRQ_HANDLED;
-}
-
-static ssize_t store_sysedp_state(struct device *dev,
-			       struct device_attribute *attr,
-			       const char *buf, size_t count)
-{
-	struct tegra_usb_modem *modem = dev_get_drvdata(dev);
-	int state;
-
-	if (sscanf(buf, "%d", &state) != 1)
-		return -EINVAL;
-
-	mutex_lock(&modem->sysedp_lock);
-	/*
-	 * If the GPIO is low we set the state, otherwise the threaded
-	 * interrupt handler will set it.
-	 */
-	if (!gpio_get_value(modem->pdata->mdm_power_report_gpio))
-		sysedp_set_state_by_name("icemdm", state);
-
-	/* store state for threaded interrupt handler */
-	modem->sysedp_prev_request = state;
-	mutex_unlock(&modem->sysedp_lock);
-
-	return count;
-}
-static DEVICE_ATTR(sysedp_state, S_IWUSR, NULL, store_sysedp_state);
 
 static irqreturn_t tegra_usb_modem_boot_thread(int irq, void *data)
 {
@@ -206,24 +251,29 @@ static irqreturn_t tegra_usb_modem_boot_thread(int irq, void *data)
 	int v = gpio_get_value(modem->pdata->boot_gpio);
 
 	dev_info(&modem->pdev->dev, "MDM_COLDBOOT %s\n", v ? "high" : "low");
-	if (modem->capability & TEGRA_USB_HOST_RELOAD)
-		if (!work_pending(&modem->host_load_work) &&
+
+	mutex_lock(&modem->lock);
+	if (modem->capability & TEGRA_USB_HOST_RELOAD) {
+		if (modem->system_suspend)
+			modem->boot_gpio_changed = true;
+		else if (!work_pending(&modem->host_load_work) &&
 		    !work_pending(&modem->host_unload_work))
 			queue_work(modem->wq, v ? &modem->host_load_work :
 				   &modem->host_unload_work);
+	}
+
+	/* USB disconnect maybe on going... */
+	if (modem->udev && modem->udev->state != USB_STATE_NOTATTACHED)
+		pr_warn("Device is not disconnected!\n");
+	mutex_unlock(&modem->lock);
 
 	/* hold wait lock to complete the enumeration */
 	wake_lock_timeout(&modem->wake_lock, WAKELOCK_TIMEOUT_FOR_USB_ENUM);
 
-	/* boost CPU freq */
-	if (!work_pending(&modem->cpu_boost_work))
+	/* boost CPU freq for timing requirements on single flash platforms */
+	if ((modem->capability & TEGRA_MODEM_CPU_BOOST) &&
+	     !work_pending(&modem->cpu_boost_work))
 		queue_work(modem->wq, &modem->cpu_boost_work);
-
-	/* USB disconnect maybe on going... */
-	mutex_lock(&modem->lock);
-	if (modem->udev && modem->udev->state != USB_STATE_NOTATTACHED)
-		pr_warn("Device is not disconnected!\n");
-	mutex_unlock(&modem->lock);
 
 	return IRQ_HANDLED;
 }
@@ -241,6 +291,26 @@ static void tegra_usb_modem_recovery(struct work_struct *ws)
 	mutex_unlock(&modem->lock);
 }
 
+static void enable_nvhsic_power(struct work_struct *ws)
+{
+	struct tegra_usb_modem *modem = container_of(ws, struct tegra_usb_modem,
+					enable_nvhsic_work.work);
+	int ret;
+
+	pr_info("Enabing XHCI HSIC\n");
+	mutex_lock(&modem->hc_lock);
+	ret = hsic_power(1);
+	if (ret) {
+		pr_err("Failed to Enable XHCI HSIC power: %d\n", ret);
+		modem->hc = NULL;
+		goto error;
+	}
+	modem->hc = (struct platform_device *)1;
+error:
+	modem->nvhsic_work_queued = false;
+	mutex_unlock(&modem->hc_lock);
+}
+
 static void tegra_usb_host_load(struct work_struct *ws)
 {
 	struct tegra_usb_modem *modem = container_of(ws, struct tegra_usb_modem,
@@ -255,7 +325,7 @@ static void tegra_usb_host_unload(struct work_struct *ws)
 	load_unload_usb_host(&modem->pdev->dev, NULL, "0", 1);
 }
 
-static void device_add_handler(struct tegra_usb_modem *modem,
+static void modem_device_add_handler(struct tegra_usb_modem *modem,
 			       struct usb_device *udev)
 {
 	const struct usb_device_descriptor *desc = &udev->descriptor;
@@ -277,6 +347,10 @@ static void device_add_handler(struct tegra_usb_modem *modem,
 		wake_lock_timeout(&modem->wake_lock,
 				  WAKELOCK_TIMEOUT_FOR_USB_ENUM);
 
+		/* enable XUSB ELPG (autosuspend) */
+		if (modem->phy_type == XHCI_HSIC)
+			pm_runtime_put(&modem->xusb_roothub->dev);
+
 		pr_info("Add device %d <%s %s>\n", udev->devnum,
 			udev->manufacturer, udev->product);
 
@@ -296,7 +370,6 @@ static void device_add_handler(struct tegra_usb_modem *modem,
 		if (modem->capability & TEGRA_MODEM_AUTOSUSPEND) {
 			pm_runtime_set_autosuspend_delay(&udev->dev,
 					modem->pdata->autosuspend_delay);
-			modem->short_autosuspend_enabled = 0;
 			usb_enable_autosuspend(udev);
 			pr_info("enable autosuspend for %s %s\n",
 				udev->manufacturer, udev->product);
@@ -306,12 +379,11 @@ static void device_add_handler(struct tegra_usb_modem *modem,
 		if (udev->actconfig->desc.bmAttributes &
 		    USB_CONFIG_ATT_WAKEUP)
 			device_set_wakeup_enable(&udev->dev, true);
-
 #endif
 	}
 }
 
-static void device_remove_handler(struct tegra_usb_modem *modem,
+static void modem_device_remove_handler(struct tegra_usb_modem *modem,
 				  struct usb_device *udev)
 {
 	const struct usb_device_descriptor *desc = &udev->descriptor;
@@ -319,6 +391,10 @@ static void device_remove_handler(struct tegra_usb_modem *modem,
 	if (desc->idVendor == modem->vid && desc->idProduct == modem->pid) {
 		pr_info("Remove device %d <%s %s>\n", udev->devnum,
 			udev->manufacturer, udev->product);
+
+		/* enable XUSB ELPG (autosuspend) */
+		if (modem->phy_type == XHCI_HSIC)
+			pm_runtime_put(&modem->xusb_roothub->dev);
 
 		mutex_lock(&modem->lock);
 		modem->udev = NULL;
@@ -332,6 +408,47 @@ static void device_remove_handler(struct tegra_usb_modem *modem,
 	}
 }
 
+
+static void xusb_usb2_roothub_add_handler(struct tegra_usb_modem *modem,
+		struct usb_device *udev)
+{
+	const struct usb_device_descriptor *desc = &udev->descriptor;
+
+	if (modem->phy_type == XHCI_HSIC &&
+		desc->idVendor == 0x1d6b && desc->idProduct == 0x2 &&
+		!strcmp(udev->serial, "tegra-xhci")) {
+		pr_info("Add device %d <%s %s>\n", udev->devnum,
+			udev->manufacturer, udev->product);
+		mutex_lock(&modem->lock);
+		modem->xusb_roothub = udev;
+		mutex_unlock(&modem->lock);
+		/* HSIC isn't enabled yet, enable it in 1 sec */
+		if (!modem->hc) {
+			modem->nvhsic_work_queued = true;
+			/* disable ELPG */
+			pm_runtime_get_sync(&modem->xusb_roothub->dev);
+			queue_delayed_work(modem->wq,
+					&modem->enable_nvhsic_work, HZ);
+		}
+	}
+}
+
+static void xusb_usb2_roothub_remove_handler(struct tegra_usb_modem *modem,
+		struct usb_device *udev)
+{
+	const struct usb_device_descriptor *desc = &udev->descriptor;
+
+	if (modem->phy_type == XHCI_HSIC &&
+		desc->idVendor == 0x1d6b && desc->idProduct == 0x2 &&
+		!strcmp(udev->serial, "tegra-xhci")) {
+		pr_info("Remove device %d <%s %s>\n", udev->devnum,
+			udev->manufacturer, udev->product);
+		mutex_lock(&modem->lock);
+		modem->xusb_roothub = NULL;
+		mutex_unlock(&modem->lock);
+	}
+}
+
 static int mdm_usb_notifier(struct notifier_block *notifier,
 			    unsigned long usb_event, void *udev)
 {
@@ -340,10 +457,12 @@ static int mdm_usb_notifier(struct notifier_block *notifier,
 
 	switch (usb_event) {
 	case USB_DEVICE_ADD:
-		device_add_handler(modem, udev);
+		modem_device_add_handler(modem, udev);
+		xusb_usb2_roothub_add_handler(modem, udev);
 		break;
 	case USB_DEVICE_REMOVE:
-		device_remove_handler(modem, udev);
+		modem_device_remove_handler(modem, udev);
+		xusb_usb2_roothub_remove_handler(modem, udev);
 		break;
 	}
 	return NOTIFY_OK;
@@ -354,6 +473,7 @@ static int mdm_pm_notifier(struct notifier_block *notifier,
 {
 	struct tegra_usb_modem *modem =
 	    container_of(notifier, struct tegra_usb_modem, pm_notifier);
+	int v;
 
 	mutex_lock(&modem->lock);
 	if (!modem->udev) {
@@ -372,19 +492,16 @@ static int mdm_pm_notifier(struct notifier_block *notifier,
 		}
 
 		modem->system_suspend = 1;
-#ifdef CONFIG_PM
-		if (modem->capability & TEGRA_MODEM_AUTOSUSPEND &&
-		    modem->udev &&
-		    modem->udev->state != USB_STATE_NOTATTACHED) {
-			pm_runtime_set_autosuspend_delay(&modem->udev->dev,
-					modem->pdata->short_autosuspend_delay);
-			modem->short_autosuspend_enabled = 1;
-		}
-#endif
 		mutex_unlock(&modem->lock);
 		return NOTIFY_OK;
 	case PM_POST_SUSPEND:
 		modem->system_suspend = 0;
+		if (modem->boot_gpio_changed) {
+			v = gpio_get_value(modem->pdata->boot_gpio);
+			queue_work(modem->wq, v ? &modem->host_load_work :
+				   &modem->host_unload_work);
+			modem->boot_gpio_changed = false;
+		}
 		mutex_unlock(&modem->lock);
 		return NOTIFY_OK;
 	}
@@ -403,10 +520,6 @@ static int mdm_request_irq(struct tegra_usb_modem *modem,
 {
 	int ret;
 
-	ret = gpio_request(irq_gpio, label);
-	if (ret)
-		return ret;
-
 	/* enable IRQ for GPIO */
 	*irq = gpio_to_irq(irq_gpio);
 
@@ -424,45 +537,47 @@ static int mdm_request_irq(struct tegra_usb_modem *modem,
 	return 0;
 }
 
-static void tegra_usb_modem_post_remote_wakeup(void)
-{
-	struct device *dev;
-	struct tegra_usb_modem *modem;
-
-	dev = bus_find_device_by_name(&platform_bus_type, NULL,
-					"MDM");
-	if (!dev) {
-		pr_warn("%s unable to find device name\n", __func__);
-		return;
-	}
-
-	modem = dev_get_drvdata(dev);
-
-	mutex_lock(&modem->lock);
-#ifdef CONFIG_PM
-	if (modem->capability & TEGRA_MODEM_AUTOSUSPEND &&
-	    modem->udev &&
-	    modem->udev->state != USB_STATE_NOTATTACHED &&
-	    modem->short_autosuspend_enabled) {
-		pm_runtime_set_autosuspend_delay(&modem->udev->dev,
-				modem->pdata->autosuspend_delay);
-		modem->short_autosuspend_enabled = 0;
-	}
-#endif
-	wake_lock_timeout(&modem->wake_lock, WAKELOCK_TIMEOUT_FOR_REMOTE_WAKE);
-	mutex_unlock(&modem->lock);
-
-	return;
-}
-
 /* load USB host controller */
 static struct platform_device *tegra_usb_host_register(
 				const struct tegra_usb_modem *modem)
 {
+	struct platform_device *pdev;
+
+#if defined(CONFIG_ARCH_TEGRA_21x_SOC)
+	struct property *status_prop;
+#else
 	const struct platform_device *hc_device =
 	    modem->pdata->tegra_ehci_device;
-	struct platform_device *pdev;
 	int val;
+#endif
+
+#if defined(CONFIG_ARCH_TEGRA_21x_SOC)
+	/* we're registering EHCI through DT here */
+
+	/* If ehci node is unavailable, we're unable to register it later.
+	 * So make it available by setting status to "okay" */
+	if (!of_device_is_available(modem->pdata->ehci_node)) {
+		pr_info("%s(): enable ehci node\n", __func__);
+		status_prop = of_find_property(modem->pdata->ehci_node,
+						"status", NULL);
+		if (!status_prop) {
+			pr_err("%s(): error getting status in ehci node\n",
+				__func__);
+			return NULL;
+		}
+		strcpy((char *)status_prop->value, "okay");
+	}
+
+	/* we have to hard-code EHCI device name here for now */
+	pdev = of_platform_device_create(modem->pdata->ehci_node,
+					"tegra-ehci.1", NULL);
+	if (!pdev) {
+		pr_info("%s: error registering EHCI\n", __func__);
+		return NULL;
+	}
+
+	return pdev;
+#else
 
 	pdev = platform_device_alloc(hc_device->name, hc_device->id);
 	if (!pdev)
@@ -477,7 +592,7 @@ static struct platform_device *tegra_usb_host_register(
 	pdev->dev.coherent_dma_mask = hc_device->dev.coherent_dma_mask;
 
 	val = platform_device_add_data(pdev, modem->pdata->tegra_ehci_pdata,
-				       sizeof(struct tegra_usb_platform_data));
+					sizeof(struct tegra_usb_platform_data));
 	if (val)
 		goto error;
 
@@ -491,12 +606,17 @@ error:
 	pr_err("%s: err %d\n", __func__, val);
 	platform_device_put(pdev);
 	return NULL;
+#endif
 }
 
 /* unload USB host controller */
-static void tegra_usb_host_unregister(struct platform_device *pdev)
+static void tegra_usb_host_unregister(const struct tegra_usb_modem *modem)
 {
-	platform_device_unregister(pdev);
+	struct platform_device *pdev = modem->hc;
+	if (unlikely(modem->pdata->tegra_ehci_device))
+		platform_device_unregister(pdev);
+	else
+		of_device_unregister(pdev);
 }
 
 static ssize_t show_usb_host(struct device *dev,
@@ -512,22 +632,53 @@ static ssize_t load_unload_usb_host(struct device *dev,
 				    const char *buf, size_t count)
 {
 	struct tegra_usb_modem *modem = dev_get_drvdata(dev);
-	int host;
+	int host, ret;
 
 	if (sscanf(buf, "%d", &host) != 1 || host < 0 || host > 1)
 		return -EINVAL;
 
-	pr_info("%s USB host\n", (host) ? "load" : "unload");
 
 	mutex_lock(&modem->hc_lock);
-	if (host) {
-		if (!modem->hc)
+	switch (modem->phy_type) {
+	case XHCI_HSIC:
+		dev_info(&modem->pdev->dev, "using XHCI_HSIC\n");
+		if (host) {
+			if (modem->xusb_roothub &&
+					!modem->nvhsic_work_queued) {
+				modem->nvhsic_work_queued = true;
+				/* disable ELPG */
+				pm_runtime_get_sync(&modem->xusb_roothub->dev);
+				/* enable HSIC power now */
+				queue_delayed_work(modem->wq,
+					&modem->enable_nvhsic_work, 0);
+			}
+		} else {
+			if (modem->xusb_roothub) {
+				pr_info("Disable XHCI HSIC\n");
+				/* disable ELPG */
+				pm_runtime_get_sync(&modem->xusb_roothub->dev);
+				ret = hsic_power(0);
+				modem->hc = NULL;
+			} else
+				pr_warn("xusb roothub not available!\n");
+		}
+		break;
+	case EHCI_HSIC:
+		dev_info(&modem->pdev->dev, "using EHCI_HSIC\n");
+		pr_info("%s EHCI\n", host ? "Load" : "Unload");
+		if (host && !modem->hc) {
 			modem->hc = tegra_usb_host_register(modem);
-	} else {
-		if (modem->hc) {
-			tegra_usb_host_unregister(modem->hc);
+		} else if (!host && modem->hc) {
+			tegra_usb_host_unregister(modem);
 			modem->hc = NULL;
 		}
+		break;
+	case XHCI_UTMI:
+		dev_info(&modem->pdev->dev, "using XHCI_UTMI\n");
+		modem->hc = host ? (struct platform_device *)1 : NULL;
+		break;
+	default:
+		pr_warn("%s: wrong phy_type:%d\n", __func__, modem->phy_type);
 	}
 	mutex_unlock(&modem->hc_lock);
 
@@ -537,8 +688,107 @@ static ssize_t load_unload_usb_host(struct device *dev,
 static DEVICE_ATTR(load_host, S_IRUSR | S_IWUSR, show_usb_host,
 		   load_unload_usb_host);
 
-static struct tegra_usb_phy_platform_ops tegra_usb_modem_platform_ops = {
-	.post_remote_wakeup = tegra_usb_modem_post_remote_wakeup,
+/* Export a new sysfs for the user land (RIL) to notify modem state
+ * Airplane mode = 0
+ * 3G/LTE mode = 1
+ * 2G mode = 2
+*/
+static ssize_t show_modem_state(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct tegra_usb_modem *modem = dev_get_drvdata(dev);
+
+	return sprintf(buf, "%d\n", modem->modem_power_state);
+}
+
+static ssize_t set_modem_state(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct tegra_usb_modem *modem = dev_get_drvdata(dev);
+	int modem_state_value;
+
+	if (sscanf(buf, "%d", &modem_state_value) != 1)
+		return -EINVAL;
+
+	mutex_lock(&modem->modem_state_lock);
+	switch (modem_state_value) {
+	case AIRPLANE:
+		modem->modem_power_state = modem_state_value;
+
+		/* Release BYPASS */
+		if (regulator_allow_bypass(modem->regulator, false))
+			dev_warn(dev,
+			"failed to set modem regulator in non bypass mode\n");
+
+		/* auto PFM mode*/
+		if (regulator_set_mode(modem->regulator, REGULATOR_MODE_NORMAL))
+			dev_warn(dev,
+			"failed to set modem regulator in normal mode\n");
+		break;
+	case RAT_2G:
+		modem->modem_power_state = modem_state_value;
+
+		/* Release BYPASS */
+		if (regulator_allow_bypass(modem->regulator, true))
+			dev_warn(dev,
+			"failed to set modem regulator in bypass mode\n");
+
+		/* forced PWM  mode*/
+		if (regulator_set_mode(modem->regulator, REGULATOR_MODE_FAST))
+			dev_warn(dev,
+			"failed to set modem regulator in fast mode\n");
+		break;
+	case RAT_3G_LTE:
+		modem->modem_power_state = modem_state_value;
+
+		/* Release BYPASS */
+		if (regulator_allow_bypass(modem->regulator, true))
+			dev_warn(dev,
+			"failed to set modem regulator in bypass mode\n");
+
+		/* auto PFM mode*/
+		if (regulator_set_mode(modem->regulator, REGULATOR_MODE_NORMAL))
+			dev_warn(dev,
+			"failed to set modem regulator in normal mode\n");
+		break;
+	default:
+		dev_warn(dev, "%s: wrong modem power state:%d\n", __func__,
+		modem_state_value);
+	}
+	mutex_unlock(&modem->modem_state_lock);
+
+	return count;
+}
+
+static DEVICE_ATTR(modem_state, S_IRUSR | S_IWUSR, show_modem_state,
+			set_modem_state);
+
+static struct modem_thermal_platform_data thermdata = {
+	.num_zones = 0,
+};
+
+static struct platform_device modem_thermal_device = {
+	.name = "modem-thermal",
+	.id = -1,
+	.num_resources = 0,
+	.dev = {
+		.platform_data = NULL,
+	},
+};
+
+static struct modem_edp_platform_data edpdata = {
+	.mdm_power_report = -1,
+	.consumer_name = "icemdm",
+};
+
+static struct platform_device modem_edp_device = {
+	.name = "sysedp_modem",
+	.id = -1,
+	.num_resources = 0,
+	.dev = {
+		.platform_data = NULL,
+	},
 };
 
 static int mdm_init(struct tegra_usb_modem *modem, struct platform_device *pdev)
@@ -550,21 +800,13 @@ static int mdm_init(struct tegra_usb_modem *modem, struct platform_device *pdev)
 	modem->pdata = pdata;
 	modem->pdev = pdev;
 
-	/* turn on modem regulator if required */
-	if (pdata->regulator_name) {
-		modem->regulator =
-			regulator_get(&pdev->dev, pdata->regulator_name);
-		if (!IS_ERR(modem->regulator)) {
-			ret = regulator_enable(modem->regulator);
-			if (ret)
-				goto error;
-		} else {
-			dev_err(&pdev->dev, "failed to get regulator %s\n",
-				pdata->regulator_name);
-			ret = PTR_ERR(modem->regulator);
-			goto error;
-		}
-	}
+#ifndef CONFIG_ARCH_TEGRA_21x_SOC
+	/* WAR to load statically defined ehci device/pdata */
+	pdata->tegra_ehci_device = &tegra_ehci2_device;
+	pdata->tegra_ehci_pdata = &tegra_ehci2_hsic_baseband_pdata;
+#endif
+
+	pdata->autosuspend_delay = DEFAULT_AUTOSUSPEND;
 
 	/* get modem operations from platform data */
 	modem->ops = (const struct tegra_modem_operations *)pdata->ops;
@@ -575,6 +817,10 @@ static int mdm_init(struct tegra_usb_modem *modem, struct platform_device *pdev)
 		if (ret)
 			goto error;
 	}
+
+	mutex_init(&(modem->lock));
+	mutex_init(&modem->hc_lock);
+	wake_lock_init(&modem->wake_lock, WAKE_LOCK_SUSPEND, "mdm_lock");
 
 	/* if wake gpio is not specified we rely on native usb remote wake */
 	if (gpio_is_valid(pdata->wake_gpio)) {
@@ -590,9 +836,6 @@ static int mdm_init(struct tegra_usb_modem *modem, struct platform_device *pdev)
 			dev_err(&pdev->dev, "request wake irq error\n");
 			goto error;
 		}
-	} else {
-		modem->pdata->tegra_ehci_pdata->ops =
-						&tegra_usb_modem_platform_ops;
 	}
 
 	if (gpio_is_valid(pdata->boot_gpio)) {
@@ -611,31 +854,6 @@ static int mdm_init(struct tegra_usb_modem *modem, struct platform_device *pdev)
 	} else
 		dev_warn(&pdev->dev, "boot irq not specified\n");
 
-	if (gpio_is_valid(pdata->mdm_power_report_gpio)) {
-		ret = mdm_request_irq(modem,
-				      tegra_usb_modem_sysedp_thread,
-				      pdata->mdm_power_report_gpio,
-				      pdata->mdm_power_irq_flags,
-				      "mdm_power_report",
-				      &modem->mdm_power_irq,
-				      &modem->mdm_power_irq_wakeable);
-		if (ret) {
-			dev_err(&pdev->dev, "request power irq error\n");
-			goto error;
-		}
-
-		disable_irq_wake(modem->mdm_power_irq);
-		modem->mdm_power_irq_wakeable = false;
-
-		ret = device_create_file(&pdev->dev, &dev_attr_sysedp_state);
-		if (ret) {
-			dev_err(&pdev->dev, "can't create edp sysfs file\n");
-			goto error;
-		}
-		modem->sysedp_file_created = 1;
-		mutex_init(&modem->sysedp_lock);
-	}
-
 	/* create sysfs node to load/unload host controller */
 	ret = device_create_file(&pdev->dev, &dev_attr_load_host);
 	if (ret) {
@@ -644,17 +862,29 @@ static int mdm_init(struct tegra_usb_modem *modem, struct platform_device *pdev)
 	}
 	modem->sysfs_file_created = 1;
 	modem->capability = TEGRA_USB_HOST_RELOAD;
-	mutex_init(&(modem->lock));
-	mutex_init(&modem->hc_lock);
-	wake_lock_init(&modem->wake_lock, WAKE_LOCK_SUSPEND, "mdm_lock");
 	if (pdev->id >= 0)
 		dev_set_name(&pdev->dev, "MDM%d", pdev->id);
 	else
 		dev_set_name(&pdev->dev, "MDM");
 
+	/* create sysfs node for RIL to report modem power state */
+	/* only if a regulator has been requested          */
+	modem->modem_state_file_created = 0;
+	if (pdata->regulator_name) {
+		ret = device_create_file(&pdev->dev, &dev_attr_modem_state);
+		if (ret) {
+			dev_err(&pdev->dev,
+			"can't create modem state sysfs file\n");
+			goto error;
+		}
+		modem->modem_state_file_created = 1;
+		mutex_init(&modem->modem_state_lock);
+	}
+
 	/* create work queue platform_driver_registe */
 	modem->wq = create_workqueue("tegra_usb_mdm_queue");
 	INIT_DELAYED_WORK(&modem->recovery_work, tegra_usb_modem_recovery);
+	INIT_DELAYED_WORK(&modem->enable_nvhsic_work, enable_nvhsic_power);
 	INIT_WORK(&modem->host_load_work, tegra_usb_host_load);
 	INIT_WORK(&modem->host_unload_work, tegra_usb_host_unload);
 	INIT_WORK(&modem->cpu_boost_work, cpu_freq_boost);
@@ -668,6 +898,22 @@ static int mdm_init(struct tegra_usb_modem *modem, struct platform_device *pdev)
 
 	usb_register_notify(&modem->usb_notifier);
 	register_pm_notifier(&modem->pm_notifier);
+
+	if (pdata->num_temp_sensors) {
+		thermdata.num_zones = pdata->num_temp_sensors;
+		modem_thermal_device.dev.platform_data = &thermdata;
+		modem->modem_thermal_pdev = &modem_thermal_device;
+		platform_device_register(modem->modem_thermal_pdev);
+	}
+
+	if (pdata->mdm_power_report_gpio) {
+		edpdata.mdm_power_report = pdata->mdm_power_report_gpio;
+		modem_edp_device.dev.platform_data = &edpdata;
+		modem->modem_edp_pdev = &modem_edp_device;
+		platform_device_register(modem->modem_edp_pdev);
+	}
+
+	modem->boot_gpio_changed = false;
 
 	/* start modem */
 	if (modem->ops && modem->ops->start)
@@ -684,34 +930,266 @@ error:
 	if (modem->boot_irq)
 		free_irq(modem->boot_irq, modem);
 
-	if (modem->sysedp_file_created)
-		device_remove_file(&pdev->dev, &dev_attr_sysedp_state);
+	if (modem->modem_state_file_created)
+		device_remove_file(&pdev->dev, &dev_attr_modem_state);
 
-	if (modem->mdm_power_irq)
-		free_irq(modem->mdm_power_irq, modem);
+	return ret;
+}
 
-	if (!IS_ERR(modem->regulator))
-		regulator_put(modem->regulator);
+static int tegra_usb_modem_parse_dt(struct tegra_usb_modem *modem,
+		struct platform_device *pdev)
+{
+	struct tegra_usb_modem_power_platform_data pdata;
+	struct device_node *node = pdev->dev.of_node;
+	struct device_node *phy_node;
+	const unsigned int *prop;
+	int gpio;
+	int ret;
+	const char *node_status;
+#if defined(CONFIG_ARCH_TEGRA_21x_SOC)
+	struct device_node *ehci_node = NULL;
+#endif
 
+	if (!node) {
+		dev_err(&pdev->dev, "Missing device tree node\n");
+		return -EINVAL;
+	}
+
+	memset(&pdata, 0, sizeof(pdata));
+
+	/* turn on modem regulator if required */
+	pdata.regulator_name = of_get_property(node, "nvidia,regulator", NULL);
+	if (pdata.regulator_name) {
+		modem->regulator = devm_regulator_get(&pdev->dev,
+				pdata.regulator_name);
+		if (IS_ERR(modem->regulator)) {
+			dev_err(&pdev->dev, "failed to get regulator %s\n",
+				pdata.regulator_name);
+			return PTR_ERR(modem->regulator);
+		}
+		ret = regulator_enable(modem->regulator);
+		if (ret) {
+			dev_err(&pdev->dev, "failed to enable regulator %s\n",
+				pdata.regulator_name);
+			return ret;
+		}
+
+		dev_info(&pdev->dev, "set modem regulator:%s\n",
+		pdata.regulator_name);
+
+		/* Enable regulator bypass */
+		if (regulator_allow_bypass(modem->regulator, true))
+			dev_warn(&pdev->dev,
+			"failed to set modem regulator in bypass mode\n");
+		else
+			dev_info(&pdev->dev,
+			"set modem regulator in bypass mode");
+
+		/* Enable autoPFM */
+		if (regulator_set_mode(modem->regulator, REGULATOR_MODE_NORMAL))
+			dev_warn(&pdev->dev,
+			"failed to set modem regulator in normal mode\n");
+		else
+			dev_info(&pdev->dev,
+			"set modem regulator in normal mode");
+
+		/* Set modem_power_state */
+		modem->modem_power_state = RAT_3G_LTE;
+	}
+
+	/* determine phy type */
+	modem->phy_type = -1;
+	ret = of_property_read_u32(node, "nvidia,phy-type", &modem->phy_type);
+	if (0 == ret) {
+		dev_info(&pdev->dev,
+			"set phy type with property 'nvidia,phy-type'\n");
+	} else {
+		dev_info(&pdev->dev,
+			"set phy type with child node 'nvidia,phy-*hci-*'\n");
+		for_each_child_of_node(node, phy_node) {
+			ret = of_property_read_string(phy_node,
+							"status", &node_status);
+			if (ret != 0) {
+				dev_err(&pdev->dev,
+					"DT property '%s/status' read fail!\n",
+					phy_node->full_name);
+				goto error;
+			}
+
+			if (strcmp(node_status, "okay") == 0) {
+				if (strcmp(phy_node->name,
+						"nvidia,phy-ehci-hsic") == 0)
+					modem->phy_type = EHCI_HSIC;
+				else if (strcmp(phy_node->name,
+						"nvidia,phy-xhci-hsic") == 0)
+					modem->phy_type = XHCI_HSIC;
+				else if (strcmp(phy_node->name,
+						"nvidia,phy-xhci-utmi") == 0)
+					modem->phy_type = XHCI_UTMI;
+				else {
+					dev_err(&pdev->dev,
+						"Unrecognized phy type node!!\n");
+					ret = -EINVAL;
+					goto error;
+				}
+			}
+		}
+	}
+	if (-1 == modem->phy_type) {
+		dev_err(&pdev->dev,
+			"Unable to set phy type!!\n");
+		ret = -EINVAL;
+		goto error;
+	}
+
+#if defined(CONFIG_ARCH_TEGRA_21x_SOC)
+	/* get EHCI device/pdata handle */
+	if (modem->phy_type == EHCI_HSIC) {
+		ehci_node = of_parse_phandle(node, "nvidia,ehci-device", 0);
+		if (!ehci_node) {
+			dev_err(&pdev->dev, "can't find nvidia,ehci-device\n");
+			return -EINVAL;
+		}
+		/* set ehci device/pdata */
+		pdata.ehci_node = ehci_node;
+	}
+#endif
+
+	prop = of_get_property(node, "nvidia,num-temp-sensors", NULL);
+	if (prop)
+		pdata.num_temp_sensors = be32_to_cpup(prop);
+
+	/* Configure input GPIOs */
+	gpio = of_get_named_gpio(node, "nvidia,wake-gpio", 0);
+	if (gpio == -EPROBE_DEFER) {
+		ret = -EPROBE_DEFER;
+		goto error;
+	}
+	pdata.wake_gpio = gpio_is_valid(gpio) ? gpio : -1;
+	dev_info(&pdev->dev, "set MDM_WAKE_AP gpio:%d\n", pdata.wake_gpio);
+	if (gpio_is_valid(gpio)) {
+		ret = devm_gpio_request(&pdev->dev, gpio, "MDM_WAKE_AP");
+		if (ret) {
+			dev_err(&pdev->dev, "request gpio %d failed\n", gpio);
+			goto error;
+		}
+		gpio_direction_input(gpio);
+	}
+
+	gpio = of_get_named_gpio(node, "nvidia,boot-gpio", 0);
+	if (gpio == -EPROBE_DEFER) {
+		ret = -EPROBE_DEFER;
+		goto error;
+	}
+	pdata.boot_gpio = gpio_is_valid(gpio) ? gpio : -1;
+	dev_info(&pdev->dev, "set MDM_COLDBOOT gpio:%d\n", pdata.boot_gpio);
+	if (gpio_is_valid(gpio)) {
+		ret = devm_gpio_request(&pdev->dev, gpio, "MDM_COLDBOOT");
+		if (ret) {
+			dev_err(&pdev->dev, "request gpio %d failed\n", gpio);
+			goto error;
+		}
+		gpio_direction_input(gpio);
+	}
+
+	gpio = of_get_named_gpio(node, "nvidia,mdm-power-report-gpio", 0);
+	if (gpio == -EPROBE_DEFER) {
+		ret = -EPROBE_DEFER;
+		goto error;
+	}
+	pdata.mdm_power_report_gpio = gpio_is_valid(gpio) ? gpio : -1;
+	dev_info(&pdev->dev, "set MDM_PWR_REPORT gpio:%d\n",
+		pdata.mdm_power_report_gpio);
+
+	gpio = of_get_named_gpio(node, "nvidia,pre-boost-gpio", 0);
+	if (gpio == -EPROBE_DEFER) {
+		ret = -EPROBE_DEFER;
+		goto error;
+	}
+	if (gpio_is_valid(gpio)) {
+		dev_info(&pdev->dev, "set pre boost gpio (%d) to 1\n", gpio);
+		ret = devm_gpio_request(&pdev->dev, gpio, "MODEM PREBOOST");
+		if (ret) {
+			dev_err(&pdev->dev, "request gpio %d failed\n", gpio);
+			goto error;
+		}
+		gpio_direction_output(gpio, 1);
+		modem->pre_boost_gpio = gpio;
+	} else
+		modem->pre_boost_gpio = -1;
+
+	/* set GPIO IRQ flags */
+	pdata.wake_irq_flags = pdata.boot_irq_flags =
+		pdata.mdm_power_irq_flags =
+		IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING | IRQF_ONESHOT;
+
+	/* initialize necessary output GPIO and start modem here */
+	gpio = of_get_named_gpio(node, "nvidia,mdm-en-gpio", 0);
+	if (gpio == -EPROBE_DEFER) {
+		ret = -EPROBE_DEFER;
+		goto error;
+	}
+	if (gpio_is_valid(gpio)) {
+		dev_info(&pdev->dev, "set MODEM EN (%d) to 1\n", gpio);
+		ret = devm_gpio_request(&pdev->dev, gpio, "MODEM EN");
+		if (ret) {
+			dev_err(&pdev->dev, "request gpio %d failed\n", gpio);
+			goto error;
+		}
+		gpio_direction_output(gpio, 1);
+	}
+
+	gpio = of_get_named_gpio(node, "nvidia,reset-gpio", 0);
+	if (gpio == -EPROBE_DEFER) {
+		ret = -EPROBE_DEFER;
+		goto error;
+	}
+	if (gpio_is_valid(gpio)) {
+		ret = devm_gpio_request(&pdev->dev, gpio, "MODEM RESET");
+		if (ret) {
+			dev_err(&pdev->dev, "request gpio %d failed\n", gpio);
+			goto error;
+		}
+		/* boot modem now */
+		/* Modem requires at least 10ms between MDM_EN assertion
+		and release of the reset. 20ms is the min value of msleep */
+		msleep(20);
+		/* Release modem reset to start boot */
+		dev_info(&pdev->dev, "set MODEM RESET (%d) to 1\n", gpio);
+		gpio_direction_output(gpio, 1);
+		gpio_export(gpio, false);
+
+		/* also create a dedicated sysfs for the modem-reset gpio */
+		gpio_export_link(&pdev->dev, "modem_reset", gpio);
+	}
+
+	/* add platform data to pdev */
+	platform_device_add_data(pdev, &pdata, sizeof(pdata));
+	return 0;
+
+error:
+	if (modem->regulator)
+		regulator_disable(modem->regulator);
 	return ret;
 }
 
 static int tegra_usb_modem_probe(struct platform_device *pdev)
 {
-	struct tegra_usb_modem_power_platform_data *pdata =
-	    pdev->dev.platform_data;
 	struct tegra_usb_modem *modem;
 	int ret = 0;
-
-	if (!pdata) {
-		dev_dbg(&pdev->dev, "platform_data not available\n");
-		return -EINVAL;
-	}
 
 	modem = kzalloc(sizeof(struct tegra_usb_modem), GFP_KERNEL);
 	if (!modem) {
 		dev_dbg(&pdev->dev, "failed to allocate memory\n");
 		return -ENOMEM;
+	}
+
+	/* initialize from device tree */
+	ret = tegra_usb_modem_parse_dt(modem, pdev);
+	if (ret) {
+		dev_err(&pdev->dev, "device tree parsing error\n");
+		kfree(modem);
+		return ret;
 	}
 
 	ret = mdm_init(modem, pdev);
@@ -732,25 +1210,26 @@ static int __exit tegra_usb_modem_remove(struct platform_device *pdev)
 	unregister_pm_notifier(&modem->pm_notifier);
 	usb_unregister_notify(&modem->usb_notifier);
 
+	if (modem->modem_edp_pdev)
+		platform_device_unregister(modem->modem_edp_pdev);
+
 	if (modem->wake_irq)
 		free_irq(modem->wake_irq, modem);
 
 	if (modem->boot_irq)
 		free_irq(modem->boot_irq, modem);
 
-	if (modem->mdm_power_irq)
-		free_irq(modem->mdm_power_irq, modem);
-
-	if (modem->sysedp_file_created)
-		device_remove_file(&pdev->dev, &dev_attr_sysedp_state);
-
 	if (modem->sysfs_file_created)
 		device_remove_file(&pdev->dev, &dev_attr_load_host);
+
+	if (modem->modem_state_file_created)
+		device_remove_file(&pdev->dev, &dev_attr_modem_state);
 
 	if (!IS_ERR(modem->regulator))
 		regulator_put(modem->regulator);
 
 	cancel_delayed_work_sync(&modem->recovery_work);
+	cancel_delayed_work_sync(&modem->enable_nvhsic_work);
 	cancel_work_sync(&modem->host_load_work);
 	cancel_work_sync(&modem->host_unload_work);
 	cancel_work_sync(&modem->cpu_boost_work);
@@ -797,6 +1276,9 @@ static int tegra_usb_modem_suspend(struct platform_device *pdev,
 			pr_info("%s, wake irq=%d, error=%d\n",
 				__func__, modem->boot_irq, ret);
 	}
+
+	if (gpio_is_valid(modem->pre_boost_gpio))
+		gpio_set_value(modem->pre_boost_gpio, 0);
 fail:
 	return ret;
 }
@@ -805,6 +1287,9 @@ static int tegra_usb_modem_resume(struct platform_device *pdev)
 {
 	struct tegra_usb_modem *modem = platform_get_drvdata(pdev);
 	int ret = 0;
+
+	if (gpio_is_valid(modem->pre_boost_gpio))
+		gpio_set_value(modem->pre_boost_gpio, 1);
 
 	if (modem->boot_irq) {
 		ret = disable_irq_wake(modem->boot_irq);
@@ -816,6 +1301,11 @@ static int tegra_usb_modem_resume(struct platform_device *pdev)
 		ret = disable_irq_wake(modem->wake_irq);
 		if (ret)
 			pr_err("Failed to disable modem wake_irq\n");
+	} else if (get_wakeup_reason_irq() == INT_USB2) {
+		pr_info("%s: remote wakeup from USB. Hold a timed wakelock\n",
+				__func__);
+		wake_lock_timeout(&modem->wake_lock,
+				WAKELOCK_TIMEOUT_FOR_REMOTE_WAKE);
 	}
 
 	/* send L3->L0 hint to modem */
@@ -825,10 +1315,17 @@ static int tegra_usb_modem_resume(struct platform_device *pdev)
 }
 #endif
 
+static const struct of_device_id tegra_usb_modem_match[] = {
+	{ .compatible = "nvidia,icera-i500", },
+	{},
+};
+MODULE_DEVICE_TABLE(of, tegra_usb_modem_match);
+
 static struct platform_driver tegra_usb_modem_power_driver = {
 	.driver = {
 		   .name = "tegra_usb_modem_power",
 		   .owner = THIS_MODULE,
+		   .of_match_table = of_match_ptr(tegra_usb_modem_match),
 		   },
 	.probe = tegra_usb_modem_probe,
 	.remove = __exit_p(tegra_usb_modem_remove),

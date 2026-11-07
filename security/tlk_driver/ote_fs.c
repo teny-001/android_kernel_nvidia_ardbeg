@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2014 NVIDIA Corporation. All rights reserved.
+ * Copyright (c) 2013-2016 NVIDIA Corporation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -27,78 +27,77 @@
 
 #include "ote_protocol.h"
 
+/* SS operation timeout in milliseconds */
+#define SS_OP_TIME_OUT 5000
+
 static DECLARE_COMPLETION(req_ready);
 static DECLARE_COMPLETION(req_complete);
 
-static struct te_ss_op *ss_op_shmem;
-static uint32_t ss_op_size;
-
-static void indicate_ss_op_complete(void)
+static void tlk_ss_reset(void)
 {
-	tlk_generic_smc(TE_SMC_SS_REQ_COMPLETE, 0, 0);
+	/* reset completion vars to default state */
+	INIT_COMPLETION(req_ready);
+	INIT_COMPLETION(req_complete);
 }
 
 int te_handle_ss_ioctl(struct file *file, unsigned int ioctl_num,
 	unsigned long ioctl_param)
 {
-	switch (ioctl_num) {
-	case TE_IOCTL_SS_NEW_REQ:
+	int ss_cmd;
+
+	if (ioctl_num != TE_IOCTL_SS_CMD)
+		return -EINVAL;
+
+	if (copy_from_user(&ss_cmd, (void __user *)ioctl_param,
+				sizeof(ss_cmd))) {
+		pr_err("%s: copy from user space failed\n", __func__);
+		return -EFAULT;
+	}
+
+	switch (ss_cmd) {
+	case TE_IOCTL_SS_CMD_GET_NEW_REQ:
 		/* wait for a new request */
 		if (wait_for_completion_interruptible(&req_ready))
 			return -ENODATA;
-
-		/* transfer pending request to daemon's buffer */
-		if (copy_to_user((void __user *)ioctl_param, ss_op_shmem,
-					ss_op_size)) {
-			pr_err("copy_to_user failed for new request\n");
-			return -EFAULT;
-		}
 		break;
-
-	case TE_IOCTL_SS_REQ_COMPLETE: /* request complete */
-		if (copy_from_user(ss_op_shmem, (void __user *)ioctl_param,
-					ss_op_size)) {
-			pr_err("copy_from_user failed for request\n");
-			return -EFAULT;
-		}
-
+	case TE_IOCTL_SS_CMD_REQ_COMPLETE:
 		/* signal the producer */
 		complete(&req_complete);
 		break;
+	default:
+		pr_err("%s: unknown ss_cmd 0x%x\n", __func__, ss_cmd);
+		return -EINVAL;
 	}
 
 	return 0;
 }
 
-void tlk_ss_op(uint32_t size)
+int tlk_ss_op(void)
 {
-	/* store size of request */
-	ss_op_size = size;
-
 	/* signal consumer */
 	complete(&req_ready);
 
 	/* wait for the consumer's signal */
-	wait_for_completion(&req_complete);
+	if (!wait_for_completion_timeout(&req_complete,
+				msecs_to_jiffies(SS_OP_TIME_OUT))) {
+		/* daemon didn't respond */
+		tlk_ss_reset();
+		return OTE_ERROR_CANCEL;
+	}
 
-	/* signal completion to the secure world */
-	indicate_ss_op_complete();
+	return OTE_SUCCESS;
 }
 
 static int __init tlk_ss_init(void)
 {
-	dma_addr_t ss_op_shmem_dma;
+	int ret;
 
-	/* allocate shared memory buffer */
-	ss_op_shmem = dma_alloc_coherent(NULL, sizeof(struct te_ss_op),
-			&ss_op_shmem_dma, GFP_KERNEL);
-	if (!ss_op_shmem) {
-		pr_err("%s: no memory available for fs operations\n", __func__);
-		return -ENOMEM;
+	/* storage disabled? */
+	ret = ote_property_is_disabled("storage");
+	if (ret) {
+		pr_warn("%s: tlk storage is disabled (%d)\n", __func__, ret);
+		return ret;
 	}
-
-	tlk_generic_smc(TE_SMC_SS_REGISTER_HANDLER,
-			(uintptr_t)tlk_ss_op, (uintptr_t)ss_op_shmem);
 
 	return 0;
 }

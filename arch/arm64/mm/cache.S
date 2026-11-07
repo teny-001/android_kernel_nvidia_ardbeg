@@ -20,6 +20,8 @@
 #include <linux/linkage.h>
 #include <linux/init.h>
 #include <asm/assembler.h>
+#include <asm/cpufeature.h>
+#include <asm/alternative-asm.h>
 
 #include "proc-macros.S"
 
@@ -32,10 +34,6 @@
  *	Corrupted registers: x0-x7, x9-x11
  */
 .macro v8_op_dcache_all op			// op=csw clean, op=cisw flush
-	dsb	sy				// ensure ordering with previous memory accesses
-	mrs	x0, clidr_el1			// read clidr
-	and	x3, x0, #0x7000000		// extract loc from clidr
-	lsr	x3, x3, #23			// left align loc bit field
 	cbz	x3, 5f			// if loc is 0, then no need to clean
 	mov	x10, #0				// start clean at cache level 0
 1:
@@ -88,6 +86,11 @@
  *	Corrupted registers: x0-x7, x9-x11
  */
 ENTRY(__flush_dcache_all)
+	dsb	sy				// ensure ordering with previous memory accesses
+	mrs	x0, clidr_el1			// read clidr
+	and	x3, x0, #0x7000000		// extract loc from clidr
+	lsr	x3, x3, #23			// left align loc bit field
+
 	v8_op_dcache_all cisw
 ENDPROC(__flush_dcache_all)
 
@@ -99,8 +102,43 @@ ENDPROC(__flush_dcache_all)
  *	Corrupted registers: x0-x7, x9-x11
  */
 ENTRY(__clean_dcache_all)
+	dsb	sy				// ensure ordering with previous memory accesses
+	mrs	x0, clidr_el1			// read clidr
+	and	x3, x0, #0x7000000		// extract loc from clidr
+	lsr	x3, x3, #23			// left align loc bit field
+
 	v8_op_dcache_all csw
 ENDPROC(__clean_dcache_all)
+
+/*
+ *	__flush_dcache_louis()
+ *
+ *	Flush D-cache to the level of unification inner shareable
+ *
+ *	Corrupted registers: x0-x7, x9-x11
+ */
+ENTRY(__flush_dcache_louis)
+	dsb	sy				// ensure ordering with previous memory accesses
+	mrs	x0, clidr_el1			// read clidr
+	and	x3, x0, #0xe00000		// extract louis from clidr
+	lsr	x3, x3, #20			// left align louis bit field
+	v8_op_dcache_all cisw
+ENDPROC(__flush_dcache_louis)
+
+/*
+ *	__clean_dcache_louis()
+ *
+ *	Clean D-cache to the level of unification inner shareable
+ *
+ *	Corrupted registers: x0-x7, x9-x11
+ */
+ENTRY(__clean_dcache_louis)
+	dsb	sy				// ensure ordering with previous memory accesses
+	mrs	x0, clidr_el1			// read clidr
+	and	x3, x0, #0xe00000		// extract louis from clidr
+	lsr	x3, x3, #20			// left align louis bit field
+	v8_op_dcache_all csw
+ENDPROC(__flush_dcache_louis)
 
 /*
  *	flush_cache_all()
@@ -118,6 +156,18 @@ ENTRY(flush_cache_all)
 	ic	ialluis				// I+BTB cache invalidate
 	ret	x12
 ENDPROC(flush_cache_all)
+
+/*
+ *	flush_cache_louis()
+ *
+ *	Actually a clean should be sufficient for PG entry
+ */
+ENTRY(flush_dcache_louis)
+	mov	x12, lr
+	bl	__flush_dcache_louis
+	mov	x0, #0
+	ret	x12
+ENDPROC(flush_dcache_louis)
 
 /*
  *	flush_icache_range(start,end)
@@ -169,7 +219,7 @@ ENDPROC(flush_icache_range)
 ENDPROC(__flush_cache_user_range)
 
 /*
- *	__flush_kern_dcache_page(kaddr)
+ *	__flush_dcache_area(kaddr, size)
  *
  *	Ensure that the data held in the page kaddr is written back to the
  *	page in question.
@@ -189,6 +239,28 @@ ENTRY(__flush_dcache_area)
 	dsb	sy
 	ret
 ENDPROC(__flush_dcache_area)
+
+/*
+ *	__clean_dcache_area(kaddr)
+ *
+ *	Ensure that the data held in the passed area is cleaned from the
+ *	cache.
+ *
+ *	- kaddr   - kernel address
+ *	- size    - size in question
+ */
+ENTRY(__clean_dcache_area)
+	dcache_line_size x2, x3
+	add	x1, x0, x1
+	sub	x3, x2, #1
+	bic	x0, x0, x3
+1:	dc	cvac, x0			// clean D line / unified line
+	add	x0, x0, x2
+	cmp	x0, x1
+	b.lo	1b
+	dsb	sy
+	ret
+ENDPROC(__clean_dcache_area)
 
 /* ==== FIXME ====
  * Below routines came from https://lkml.org/lkml/2012/9/7/514
@@ -226,7 +298,7 @@ ENTRY(dmac_clean_range)
 	dcache_line_size x2, x3
 	sub	x3, x2, #1
 	bic	x0, x0, x3
-1:	dc	cvac, x0			// clean D / U line
+1:	alternative_insn "dc cvac, x0", "dc civac, x0", ARM64_WORKAROUND_CLEAN_CACHE
 	add	x0, x0, x2
 	cmp	x0, x1
 	b.lo	1b

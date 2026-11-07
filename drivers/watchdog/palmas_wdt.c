@@ -3,7 +3,7 @@
  *
  * Watchdog timer for Palmas PMIC.
  *
- * Copyright (c) 2013, NVIDIA Corporation. All rights reserved.
+ * Copyright (c) 2013-2016, NVIDIA Corporation. All rights reserved.
  *
  * Author: Laxman Dewangan <ldewangan@nvidia.com>
  *
@@ -22,6 +22,7 @@
  * 02111-1307, USA
  */
 
+#include <linux/alarmtimer.h>
 #include <linux/device.h>
 #include <linux/err.h>
 #include <linux/init.h>
@@ -29,9 +30,9 @@
 #include <linux/irq.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
-#include <linux/of.h>
-#include <linux/of_device.h>
 #include <linux/mfd/palmas.h>
+#include <linux/of.h>
+#include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm.h>
 #include <linux/slab.h>
@@ -44,8 +45,12 @@ struct palmas_wdt {
 	struct device *dev;
 	struct palmas *palmas;
 	int timeout;
+	int org_timeout;
 	int irq;
 	int locked;
+	int watchdog_timer_initial_period;
+	int rtc_wakeup_period;
+	int interrupt_mode;
 };
 
 static irqreturn_t palmas_wdt_irq(int irq, void *data)
@@ -74,8 +79,6 @@ static int palmas_wdt_start(struct watchdog_device *wdt_dev)
 		dev_err(wdt->dev, "WATCHDOG update failed: %d\n", ret);
 		return ret;
 	}
-
-	dev_info(wdt->dev, "WDT Started\n");
 	return 0;
 }
 
@@ -96,7 +99,6 @@ static int palmas_wdt_stop(struct watchdog_device *wdt_dev)
 		dev_err(wdt->dev, "WATCHDOG update failed: %d\n", ret);
 		return ret;
 	}
-	dev_info(wdt->dev, "WDT Stopped\n");
 	return 0;
 }
 
@@ -122,7 +124,6 @@ static int palmas_wdt_set_timeout(struct watchdog_device *wdt_dev,
 		return ret;
 	}
 	wdt->timeout = timeout;
-	dev_info(wdt->dev, "WDT Timeout %d\n", timeout);
 	return 0;
 }
 
@@ -138,14 +139,81 @@ static const struct watchdog_ops palmas_wdt_ops = {
 	.set_timeout = palmas_wdt_set_timeout,
 };
 
+static int palmas_wdt_restart(struct watchdog_device *wdt_dev,
+		unsigned int timeout)
+{
+	int ret;
+
+	if (!timeout)
+		return 0;
+
+	ret = palmas_wdt_set_timeout(wdt_dev, timeout);
+	if (!ret)
+		ret = palmas_wdt_start(wdt_dev);
+
+	return ret;
+}
+
+static ssize_t show_wdt_state(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct palmas_wdt *wdt = dev_get_drvdata(dev);
+
+	return sprintf(buf, "%s",
+			(wdt->timeout) ? "enable\n" : "disable\n");
+}
+
+static ssize_t set_wdt_state(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct palmas_wdt *wdt = dev_get_drvdata(dev);
+	int enable;
+	char *p = (char *)buf;
+	char ch = *p;
+	int ret;
+
+	if ((ch == 'e') || (ch == 'E'))
+		enable = 1;
+	else if ((ch == 'd') || (ch == 'D'))
+		enable = 0;
+	else
+		return -EINVAL;
+
+	if (enable && wdt->timeout)
+		return count;
+	if (!enable && !wdt->timeout)
+		return count;
+
+	if (enable)
+		wdt->timeout = wdt->org_timeout;
+	else
+		wdt->timeout = 0;
+
+	if (wdt->org_timeout) {
+		if (wdt->timeout) {
+			ret = palmas_wdt_restart(&wdt->wdt_dev,
+						wdt->timeout);
+		if (ret < 0)
+			dev_err(wdt->dev,
+				"Watchdog not restarted %d\n", ret);
+
+		} else {
+			ret = palmas_wdt_stop(&wdt->wdt_dev);
+			if (ret < 0)
+				dev_err(wdt->dev, "wdt stop failed: %d\n", ret);
+		}
+	}
+	return count;
+}
+
+static DEVICE_ATTR(watchdog_state, 0644, show_wdt_state, set_wdt_state);
+
 static int palmas_wdt_probe(struct platform_device *pdev)
 {
 	struct palmas_platform_data *pdata;
 	struct palmas_wdt *wdt;
 	struct watchdog_device *wdt_dev;
 	unsigned int regval;
-	u32 pval;
-	int wdt_timer_period = 0;
 	int ret;
 
 	wdt = devm_kzalloc(&pdev->dev, sizeof(*wdt), GFP_KERNEL);
@@ -154,17 +222,32 @@ static int palmas_wdt_probe(struct platform_device *pdev)
 
 	pdata = dev_get_platdata(pdev->dev.parent);
 	if (pdata)
-		wdt_timer_period = pdata->watchdog_timer_initial_period;
-	if (!wdt_timer_period && pdev->dev.of_node) {
+		wdt->watchdog_timer_initial_period =
+			pdata->watchdog_timer_initial_period;
+	if (!wdt->watchdog_timer_initial_period && pdev->dev.of_node) {
+		u32 pval = 0;
 		ret = of_property_read_u32(pdev->dev.of_node,
-				"ti,system-watchdog-timer-period", &pval);
+			"ti,watchdog-init-timeout", &pval);
 		if (!ret)
-			wdt_timer_period = pval;
+			wdt->watchdog_timer_initial_period = pval;
+		wdt->interrupt_mode = of_property_read_bool(pdev->dev.of_node,
+					"ti,watchdog-interrupt-mode");
+		if (wdt->interrupt_mode) {
+			if (wdt->watchdog_timer_initial_period) {
+				wdt->rtc_wakeup_period = wdt->watchdog_timer_initial_period;
+				if (wdt->watchdog_timer_initial_period > 128)
+					wdt->watchdog_timer_initial_period = 128;
+			}
+		} else {
+			if (wdt->watchdog_timer_initial_period > 128)
+				wdt->watchdog_timer_initial_period = 128;
+		}
 	}
 
 	wdt->dev = &pdev->dev;
 	wdt->palmas = dev_get_drvdata(pdev->dev.parent);
 	wdt->irq = palmas_irq_get_virq(wdt->palmas, PALMAS_WDT_IRQ);
+	wdt->org_timeout = wdt->watchdog_timer_initial_period;
 	wdt_dev = &wdt->wdt_dev;
 
 	wdt_dev->info = &palmas_wdt_info;
@@ -191,6 +274,10 @@ static int palmas_wdt_probe(struct platform_device *pdev)
 		return ret;
 	}
 
+	ret = device_create_file(&pdev->dev, &dev_attr_watchdog_state);
+	if (ret < 0)
+		dev_warn(&pdev->dev, "sysfs creation failed: %d\n", ret);
+
 	ret = palmas_read(wdt->palmas, PALMAS_PMU_CONTROL_BASE,
 			PALMAS_WATCHDOG, &regval);
 	if (ret < 0) {
@@ -214,15 +301,19 @@ static int palmas_wdt_probe(struct platform_device *pdev)
 		}
 	}
 
+	regval = (wdt->interrupt_mode) ? PALMAS_WATCHDOG_MODE : 0;
 	ret = palmas_update_bits(wdt->palmas, PALMAS_PMU_CONTROL_BASE,
-			PALMAS_WATCHDOG, PALMAS_WATCHDOG_MODE, 0);
+			PALMAS_WATCHDOG, PALMAS_WATCHDOG_MODE, regval);
 	if (ret < 0) {
 		dev_err(wdt->dev, "WATCHDOG update failed: %d\n", ret);
 		goto scrub;
 	}
 
-	if (wdt_timer_period) {
-		ret = palmas_wdt_set_timeout(wdt_dev, wdt_timer_period);
+	if (wdt->watchdog_timer_initial_period > 0) {
+		dev_info(wdt->dev, "WATCHDOG starting with timeout %d\n",
+				wdt->watchdog_timer_initial_period);
+		ret = palmas_wdt_set_timeout(wdt_dev,
+					wdt->watchdog_timer_initial_period);
 		if (ret < 0) {
 			dev_err(wdt->dev, "wdt set timeout failed: %d\n", ret);
 			goto scrub;
@@ -237,7 +328,13 @@ static int palmas_wdt_probe(struct platform_device *pdev)
 		}
 	}
 
+	if (wdt->rtc_wakeup_period)
+		alarmtimer_set_maximum_wakeup_interval_time(
+				wdt->rtc_wakeup_period);
+
 	device_set_wakeup_capable(&pdev->dev, 1);
+	device_wakeup_enable(&pdev->dev);
+
 	return 0;
 scrub:
 	free_irq(wdt->irq, wdt);
@@ -291,18 +388,19 @@ static const struct dev_pm_ops palmas_wdt_pm_ops = {
 	SET_SYSTEM_SLEEP_PM_OPS(palmas_wdt_suspend, palmas_wdt_resume)
 };
 
-static struct of_device_id of_palmas_wdt_match_tbl[] = {
-	{ .compatible = "ti,palmas-watchdog", },
-	{},
+static struct of_device_id of_palmas_wdt[] = {
+        { .compatible = "ti,palmas-wdt", },
+        { .compatible = "ti,palmas-watchdog", },
+        { /* end */ }
 };
-MODULE_DEVICE_TABLE(of, of_palmas_wdt_match_tbl);
+MODULE_DEVICE_TABLE(of, of_palmas_wdt);
 
 static struct platform_driver palmas_wdt_driver = {
 	.driver	= {
 		.name	= "palmas-wdt",
 		.owner	= THIS_MODULE,
 		.pm = &palmas_wdt_pm_ops,
-		.of_match_table = of_palmas_wdt_match_tbl,
+		.of_match_table = of_palmas_wdt,
 	},
 	.probe	= palmas_wdt_probe,
 	.remove	= palmas_wdt_remove,

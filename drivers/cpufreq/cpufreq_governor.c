@@ -8,6 +8,7 @@
  *		(C) 2003 Jun Nakajima <jun.nakajima@intel.com>
  *		(C) 2009 Alexander Clouter <alex@digriz.org.uk>
  *		(c) 2012 Viresh Kumar <viresh.kumar@linaro.org>
+ * Copyright (c) 2014, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -16,15 +17,9 @@
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
-#include <asm/cputime.h>
-#include <linux/cpufreq.h>
-#include <linux/cpumask.h>
 #include <linux/export.h>
 #include <linux/kernel_stat.h>
-#include <linux/mutex.h>
 #include <linux/slab.h>
-#include <linux/types.h>
-#include <linux/workqueue.h>
 
 #include "cpufreq_governor.h"
 
@@ -53,7 +48,7 @@ void dbs_check_cpu(struct dbs_data *dbs_data, int cpu)
 
 	policy = cdbs->cur_policy;
 
-	/* Get Absolute Load (in terms of freq for ondemand gov) */
+	/* Get Absolute Load */
 	for_each_cpu(j, policy->cpus) {
 		struct cpu_dbs_common_info *j_cdbs;
 		u64 cur_wall_time, cur_idle_time;
@@ -104,14 +99,6 @@ void dbs_check_cpu(struct dbs_data *dbs_data, int cpu)
 
 		load = 100 * (wall_time - idle_time) / wall_time;
 
-		if (dbs_data->cdata->governor == GOV_ONDEMAND) {
-			int freq_avg = __cpufreq_driver_getavg(policy, j);
-			if (freq_avg <= 0)
-				freq_avg = policy->cur;
-
-			load *= freq_avg;
-		}
-
 		if (load > max_load)
 			max_load = load;
 	}
@@ -132,6 +119,9 @@ void gov_queue_work(struct dbs_data *dbs_data, struct cpufreq_policy *policy,
 		unsigned int delay, bool all_cpus)
 {
 	int i;
+
+	if (!policy->governor_enabled)
+		return;
 
 	if (!all_cpus) {
 		__gov_queue_work(smp_processor_id(), dbs_data, delay);
@@ -231,6 +221,9 @@ int cpufreq_governor_dbs(struct cpufreq_policy *policy,
 			return rc;
 		}
 
+		if (!have_governor_per_policy())
+			WARN_ON(cpufreq_get_global_kobject());
+
 		rc = sysfs_create_group(get_governor_parent_kobj(policy),
 				get_sysfs_attr(dbs_data));
 		if (rc) {
@@ -268,6 +261,9 @@ int cpufreq_governor_dbs(struct cpufreq_policy *policy,
 		if (!--dbs_data->usage_count) {
 			sysfs_remove_group(get_governor_parent_kobj(policy),
 					get_sysfs_attr(dbs_data));
+
+			if (!have_governor_per_policy())
+				cpufreq_put_global_kobject();
 
 			if ((dbs_data->cdata->governor == GOV_CONSERVATIVE) &&
 				(policy->governor->initialized == 1)) {
@@ -364,6 +360,11 @@ int cpufreq_governor_dbs(struct cpufreq_policy *policy,
 		break;
 
 	case CPUFREQ_GOV_LIMITS:
+		mutex_lock(&dbs_data->mutex);
+		if (!cpu_cdbs->cur_policy) {
+			mutex_unlock(&dbs_data->mutex);
+			break;
+		}
 		mutex_lock(&cpu_cdbs->timer_mutex);
 		if (policy->max < cpu_cdbs->cur_policy->cur)
 			__cpufreq_driver_target(cpu_cdbs->cur_policy,
@@ -373,6 +374,7 @@ int cpufreq_governor_dbs(struct cpufreq_policy *policy,
 					policy->min, CPUFREQ_RELATION_L);
 		dbs_check_cpu(dbs_data, cpu);
 		mutex_unlock(&cpu_cdbs->timer_mutex);
+		mutex_unlock(&dbs_data->mutex);
 		break;
 	}
 	return 0;

@@ -3,6 +3,7 @@
  *
  *      Copyright (C) 2005-2010
  *          Laurent Pinchart (laurent.pinchart@ideasonboard.com)
+ *      Copyright (C) 2016, NVIDIA Corporation.  All rights reserved.
  *
  *      This program is free software; you can redistribute it and/or modify
  *      it under the terms of the GNU General Public License as published by
@@ -361,6 +362,14 @@ static int uvc_commit_video(struct uvc_streaming *stream,
  * Clocks and timestamps
  */
 
+static inline void uvc_video_get_ts(struct timespec *ts)
+{
+	if (uvc_clock_param == CLOCK_MONOTONIC)
+		ktime_get_ts(ts);
+	else
+		ktime_get_real_ts(ts);
+}
+
 static void
 uvc_video_clock_decode(struct uvc_streaming *stream, struct uvc_buffer *buf,
 		       const __u8 *data, int len)
@@ -420,7 +429,7 @@ uvc_video_clock_decode(struct uvc_streaming *stream, struct uvc_buffer *buf,
 	stream->clock.last_sof = dev_sof;
 
 	host_sof = usb_get_current_frame_number(stream->dev->udev);
-	ktime_get_ts(&ts);
+	uvc_video_get_ts(&ts);
 
 	/* The UVC specification allows device implementations that can't obtain
 	 * the USB frame number to keep their own frame counters as long as they
@@ -1010,10 +1019,7 @@ static int uvc_video_decode_start(struct uvc_streaming *stream,
 			return -ENODATA;
 		}
 
-		if (uvc_clock_param == CLOCK_MONOTONIC)
-			ktime_get_ts(&ts);
-		else
-			ktime_get_real_ts(&ts);
+		uvc_video_get_ts(&ts);
 
 		buf->buf.v4l2_buf.sequence = stream->sequence;
 		buf->buf.v4l2_buf.timestamp.tv_sec = ts.tv_sec;
@@ -1333,6 +1339,41 @@ static void uvc_video_complete(struct urb *urb)
 	}
 }
 
+static void uvc_free_urbs(struct uvc_streaming *stream)
+{
+	kfree(stream->urb);
+	kfree(stream->urb_buffer);
+	kfree(stream->urb_dma);
+
+	stream->urb = NULL;
+	stream->urb_num = 0;
+	stream->urb_buffer = NULL;
+	stream->urb_dma = NULL;
+}
+
+static int uvc_init_urbs(struct uvc_streaming *stream)
+{
+	int num = stream->urb_num;
+
+	stream->urb = kcalloc(num, sizeof(struct urb *), GFP_KERNEL);
+	if (stream->urb == NULL)
+		goto error;
+
+	stream->urb_buffer = kcalloc(num, sizeof(char *), GFP_KERNEL);
+	if (stream->urb_buffer == NULL)
+		goto error;
+
+	stream->urb_dma = kcalloc(num, sizeof(dma_addr_t), GFP_KERNEL);
+	if (stream->urb_dma == NULL)
+		goto error;
+
+	return 0;
+error:
+	uvc_free_urbs(stream);
+
+	return -ENOMEM;
+}
+
 /*
  * Free transfer buffers.
  */
@@ -1340,7 +1381,7 @@ static void uvc_free_urb_buffers(struct uvc_streaming *stream)
 {
 	unsigned int i;
 
-	for (i = 0; i < UVC_URBS; ++i) {
+	for (i = 0; i < stream->urb_num; ++i) {
 		if (stream->urb_buffer[i]) {
 #ifndef CONFIG_DMA_NONCOHERENT
 			usb_free_coherent(stream->dev->udev, stream->urb_size,
@@ -1376,16 +1417,22 @@ static int uvc_alloc_urb_buffers(struct uvc_streaming *stream,
 	if (stream->urb_size)
 		return stream->urb_size / psize;
 
+	if (uvc_init_urbs(stream) != 0) {
+		uvc_trace(UVC_TRACE_VIDEO,
+			"Failed to init %d URBs.\n", stream->urb_num);
+		return 0;
+	}
+
 	/* Compute the number of packets. Bulk endpoints might transfer UVC
 	 * payloads across multiple URBs.
 	 */
 	npackets = DIV_ROUND_UP(size, psize);
-	if (npackets > UVC_MAX_PACKETS)
-		npackets = UVC_MAX_PACKETS;
+	if (npackets > stream->urb_max_packets)
+		npackets = stream->urb_max_packets;
 
 	/* Retry allocations until one succeed. */
 	for (; npackets > 1; npackets /= 2) {
-		for (i = 0; i < UVC_URBS; ++i) {
+		for (i = 0; i < stream->urb_num; ++i) {
 			stream->urb_size = psize * npackets;
 #ifndef CONFIG_DMA_NONCOHERENT
 			stream->urb_buffer[i] = usb_alloc_coherent(
@@ -1401,14 +1448,15 @@ static int uvc_alloc_urb_buffers(struct uvc_streaming *stream,
 			}
 		}
 
-		if (i == UVC_URBS) {
-			uvc_trace(UVC_TRACE_VIDEO, "Allocated %u URB buffers "
-				"of %ux%u bytes each.\n", UVC_URBS, npackets,
-				psize);
+		if (i == stream->urb_num) {
+			uvc_trace(UVC_TRACE_VIDEO,
+				"Allocated %u URB buffers of %ux%u bytes each.\n",
+				stream->urb_num, npackets, psize);
 			return npackets;
 		}
 	}
 
+	uvc_free_urbs(stream);
 	uvc_trace(UVC_TRACE_VIDEO, "Failed to allocate URB buffers (%u bytes "
 		"per packet).\n", psize);
 	return 0;
@@ -1424,7 +1472,7 @@ static void uvc_uninit_video(struct uvc_streaming *stream, int free_buffers)
 
 	uvc_video_stats_stop(stream);
 
-	for (i = 0; i < UVC_URBS; ++i) {
+	for (i = 0; i < stream->urb_num; ++i) {
 		urb = stream->urb[i];
 		if (urb == NULL)
 			continue;
@@ -1434,8 +1482,10 @@ static void uvc_uninit_video(struct uvc_streaming *stream, int free_buffers)
 		stream->urb[i] = NULL;
 	}
 
-	if (free_buffers)
+	if (free_buffers) {
 		uvc_free_urb_buffers(stream);
+		uvc_free_urbs(stream);
+	}
 }
 
 /*
@@ -1473,13 +1523,16 @@ static int uvc_init_video_isoc(struct uvc_streaming *stream,
 	psize = uvc_endpoint_max_bpi(stream->dev->udev, ep);
 	size = stream->ctrl.dwMaxVideoFrameSize;
 
+	stream->urb_num = UVC_URBS;
+	stream->urb_max_packets = UVC_MAX_PACKETS;
+
 	npackets = uvc_alloc_urb_buffers(stream, size, psize, gfp_flags);
 	if (npackets == 0)
 		return -ENOMEM;
 
 	size = npackets * psize;
 
-	for (i = 0; i < UVC_URBS; ++i) {
+	for (i = 0; i < stream->urb_num; ++i) {
 		urb = usb_alloc_urb(npackets, gfp_flags);
 		if (urb == NULL) {
 			uvc_uninit_video(stream, 1);
@@ -1523,11 +1576,36 @@ static int uvc_init_video_bulk(struct uvc_streaming *stream,
 	struct urb *urb;
 	unsigned int npackets, pipe, i;
 	u16 psize;
-	u32 size;
+	u32 size, max_video_frame_size;
 
 	psize = usb_endpoint_maxp(&ep->desc) & 0x7ff;
 	size = stream->ctrl.dwMaxPayloadTransferSize;
 	stream->bulk.max_payload_size = size;
+
+	/*
+	 * Criteria:
+	 * - An URB can accommodate an uvc payload.
+	 *   => urb_size (urb_max_packets * psize) >= size
+	 *   => urb_size ~= size
+	 * - Enough URBs for an uvc frame are needed
+	 *   => urb_num >= payload_num for a uvc frame
+	 *   => urb_num ~= payload_num
+	 * - urb_size * urb_num >= dwMaxVideoFrameSize +
+	 *   payload_header_size * payload_num
+	 * - size is much larger than payload_header_size
+	 *   (payload_header_size is usually 12 bytes.)
+	 */
+	stream->urb_max_packets = DIV_ROUND_UP(size, psize);
+	max_video_frame_size = stream->ctrl.dwMaxVideoFrameSize;
+
+	/*
+	 * Prevent system to allocate too much urb/memory.
+	 * limit allocated memory to a 1080p frame size
+	 * 1920*1080*2(yuv)=4147200
+	 */
+	if (max_video_frame_size > 4147200)
+		max_video_frame_size = 4147200;
+	stream->urb_num = max_video_frame_size / size + 1;
 
 	npackets = uvc_alloc_urb_buffers(stream, size, psize, gfp_flags);
 	if (npackets == 0)
@@ -1545,7 +1623,7 @@ static int uvc_init_video_bulk(struct uvc_streaming *stream,
 	if (stream->type == V4L2_BUF_TYPE_VIDEO_OUTPUT)
 		size = 0;
 
-	for (i = 0; i < UVC_URBS; ++i) {
+	for (i = 0; i < stream->urb_num; ++i) {
 		urb = usb_alloc_urb(0, gfp_flags);
 		if (urb == NULL) {
 			uvc_uninit_video(stream, 1);
@@ -1650,7 +1728,7 @@ static int uvc_init_video(struct uvc_streaming *stream, gfp_t gfp_flags)
 		return ret;
 
 	/* Submit the URBs. */
-	for (i = 0; i < UVC_URBS; ++i) {
+	for (i = 0; i < stream->urb_num; ++i) {
 		ret = usb_submit_urb(stream->urb[i], gfp_flags);
 		if (ret < 0) {
 			uvc_printk(KERN_ERR, "Failed to submit URB %u "
@@ -1846,7 +1924,25 @@ int uvc_video_enable(struct uvc_streaming *stream, int enable)
 
 	if (!enable) {
 		uvc_uninit_video(stream, 1);
-		usb_set_interface(stream->dev->udev, stream->intfnum, 0);
+		if (stream->intf->num_altsetting > 1) {
+			usb_set_interface(stream->dev->udev,
+					  stream->intfnum, 0);
+		} else {
+			/* UVC doesn't specify how to inform a bulk-based device
+			 * when the video stream is stopped. Windows sends a
+			 * CLEAR_FEATURE(HALT) request to the video streaming
+			 * bulk endpoint, mimic the same behaviour.
+			 */
+			unsigned int epnum = stream->header.bEndpointAddress
+					   & USB_ENDPOINT_NUMBER_MASK;
+			unsigned int dir = stream->header.bEndpointAddress
+					 & USB_ENDPOINT_DIR_MASK;
+			unsigned int pipe;
+
+			pipe = usb_sndbulkpipe(stream->dev->udev, epnum) | dir;
+			usb_clear_halt(stream->dev->udev, pipe);
+		}
+
 		uvc_queue_enable(&stream->queue, 0);
 		uvc_video_clock_cleanup(stream);
 		return 0;

@@ -1,7 +1,7 @@
 /*
  * arch/arm/mach-tegra/tegra_simon.c
  *
- * Copyright (c) 2013-2014, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2013-2015, NVIDIA CORPORATION. All rights reserved.
  *
  * This software is licensed under the terms of the GNU General Public
  * License version 2, as published by the Free Software Foundation, and
@@ -28,10 +28,10 @@
 #include <linux/regulator/consumer.h>
 
 #include "tegra_simon.h"
-#include "clock.h"
-#include "dvfs.h"
+#include <linux/platform/tegra/clock.h>
+#include <linux/platform/tegra/dvfs.h>
 #include "pm.h"
-#include "tegra_cl_dvfs.h"
+#include <linux/platform/tegra/tegra_cl_dvfs.h>
 
 static DEFINE_MUTEX(simon_lock);
 static RAW_NOTIFIER_HEAD(simon_nh);
@@ -197,10 +197,11 @@ static int __init tegra_simon_init_gpu(void)
 		    (unsigned long)grader);
 	INIT_WORK(&grader->grade_update_work, tegra_simon_grade_notify);
 
-	grader->tzd = thermal_zone_device_find_by_name("GPU-therm");
-	if (!grader->tzd) {
+	grader->tzd = thermal_zone_get_zone_by_name("GPU-therm");
+	if (IS_ERR(grader->tzd)) {
 		pr_err("%s: Failed to find %s thermal zone\n",
 		       __func__, grader->domain_name);
+		grader->tzd = NULL;
 		return -ENOENT;
 	}
 
@@ -228,13 +229,12 @@ static int __init tegra_simon_init_gpu(void)
  * met, next grading is always separated by the grading interval from the last
  * successful grading.
  */
-extern int tegra_cl_dvfs_clamp_at_vmin(struct tegra_cl_dvfs *cld, bool clamp);
 static int tegra_simon_cpu_grading_cb(
 	struct notifier_block *nb, unsigned long rate, void *v)
 {
 	struct tegra_simon_grader *grader = container_of(
 		nb, struct tegra_simon_grader, grading_condition_nb);
-	struct tegra_cl_dvfs *cld;
+	struct clk *dfll_clk;
 
 	unsigned long t;
 	int mv;
@@ -256,15 +256,9 @@ static int tegra_simon_cpu_grading_cb(
 	if (t < grader->desc->grading_temperature_min)
 		return NOTIFY_OK;
 
-	cld = tegra_dfll_get_cl_dvfs_data(
-		clk_get_parent(clk_get_parent(grader->clk)));
-	if (IS_ERR(cld)) {
-		pr_err("%s: Failed to get cl_dvfs data for %s\n",
-		       __func__, grader->domain_name);
-		return NOTIFY_OK;
-	}
+	dfll_clk = clk_get_parent(clk_get_parent(grader->clk));
 
-	mv = tegra_cl_dvfs_clamp_at_vmin(cld, true);
+	mv = tegra_dvfs_clamp_dfll_at_vmin(dfll_clk, true);
 	if (mv < 0) {
 		pr_err("%s: Failed to clamp %s voltage\n",
 		       __func__, grader->domain_name);
@@ -277,12 +271,12 @@ static int tegra_simon_cpu_grading_cb(
 		if (grade < 0) {
 			pr_err("%s: Failed to grade %s\n",
 			       __func__, grader->domain_name);
-			tegra_cl_dvfs_clamp_at_vmin(cld, false);
+			tegra_dvfs_clamp_dfll_at_vmin(dfll_clk, false);
 			return NOTIFY_OK;
 		}
 
 	}
-	tegra_cl_dvfs_clamp_at_vmin(cld, false);
+	tegra_dvfs_clamp_dfll_at_vmin(dfll_clk, false);
 
 	grader->last_grading = ktime_get();
 	tegra_simon_grade_set(grader, grade);
@@ -305,8 +299,8 @@ static int __init tegra_simon_init_cpu(void)
 		    (unsigned long)grader);
 	INIT_WORK(&grader->grade_update_work, tegra_simon_grade_notify);
 
-	grader->tzd = thermal_zone_device_find_by_name("CPU-therm");
-	if (!grader->tzd) {
+	grader->tzd = thermal_zone_get_zone_by_name("CPU-therm");
+	if (IS_ERR(grader->tzd)) {
 		pr_err("%s: Failed to find %s thermal zone\n",
 		       __func__, grader->domain_name);
 		return -ENOENT;
@@ -503,7 +497,8 @@ late_initcall(simon_debugfs_init);
 #endif
 
 /* FIXME: Add fake graders - to be removed when actual graders are implemnted */
-#if CONFIG_ARCH_TEGRA_12x_SOC
+#ifdef CONFIG_ARCH_TEGRA_12x_SOC
+#ifndef CONFIG_ARCH_TEGRA_13x_SOC
 static int fake_grader(int domain, int mv, int temperature)
 {
 	return 0;	/* safe low grade */
@@ -532,4 +527,5 @@ static int __init tegra_simon_add_graders(void)
 	return 0;
 }
 late_initcall_sync(tegra_simon_add_graders);
+#endif
 #endif

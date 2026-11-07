@@ -27,12 +27,6 @@
 
 DEFINE_MUTEX(event_mutex);
 
-DEFINE_MUTEX(event_storage_mutex);
-EXPORT_SYMBOL_GPL(event_storage_mutex);
-
-char event_storage[EVENT_STORAGE_SIZE];
-EXPORT_SYMBOL_GPL(event_storage);
-
 LIST_HEAD(ftrace_events);
 static LIST_HEAD(ftrace_common_fields);
 
@@ -431,7 +425,7 @@ static void remove_event_file_dir(struct ftrace_event_file *file)
 
 	if (dir) {
 		spin_lock(&dir->d_lock);	/* probably unneeded */
-		list_for_each_entry(child, &dir->d_subdirs, d_u.d_child) {
+		list_for_each_entry(child, &dir->d_subdirs, d_child) {
 			if (child->d_inode)	/* probably unneeded */
 				child->d_inode->i_private = NULL;
 		}
@@ -1084,6 +1078,9 @@ static int subsystem_open(struct inode *inode, struct file *filp)
 	struct trace_array *tr;
 	int ret;
 
+	if (tracing_is_disabled())
+		return -ENODEV;
+
 	/* Make sure the system still exists */
 	mutex_lock(&trace_types_lock);
 	mutex_lock(&event_mutex);
@@ -1130,6 +1127,9 @@ static int system_tr_open(struct inode *inode, struct file *filp)
 	struct trace_array *tr = inode->i_private;
 	int ret;
 
+	if (tracing_is_disabled())
+		return -ENODEV;
+
 	if (trace_array_get(tr) < 0)
 		return -ENODEV;
 
@@ -1146,11 +1146,12 @@ static int system_tr_open(struct inode *inode, struct file *filp)
 	if (ret < 0) {
 		trace_array_put(tr);
 		kfree(dir);
+		return ret;
 	}
 
 	filp->private_data = dir;
 
-	return ret;
+	return 0;
 }
 
 static int subsystem_release(struct inode *inode, struct file *file)
@@ -1859,6 +1860,16 @@ static void trace_module_add_events(struct module *mod)
 {
 	struct ftrace_module_file_ops *file_ops = NULL;
 	struct ftrace_event_call **call, **start, **end;
+
+	if (!mod->num_trace_events)
+		return;
+
+	/* Don't add infrastructure for mods without tracepoints */
+	if (trace_module_has_bad_taint(mod)) {
+		pr_err("%s: module has bad taint, not creating trace events\n",
+		       mod->name);
+		return;
+	}
 
 	start = mod->trace_events;
 	end = mod->trace_events + mod->num_trace_events;

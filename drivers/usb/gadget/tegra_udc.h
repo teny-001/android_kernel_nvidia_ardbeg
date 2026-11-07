@@ -41,8 +41,11 @@
 #define USB_CHARGING_DCP_CURRENT_LIMIT_UA 1500000u
 #define USB_CHARGING_CDP_CURRENT_LIMIT_UA 1500000u
 #define USB_CHARGING_SDP_CURRENT_LIMIT_UA 500000u
-#define USB_CHARGING_NV_CHARGER_CURRENT_LIMIT_UA 2000000u
+#define USB_CHARGING_NV_CHARGER_CURRENT_LIMIT_UA 3000000u
 #define USB_CHARGING_NON_STANDARD_CHARGER_CURRENT_LIMIT_UA 500000u
+#define USB_CHARGING_ACA_NV_CHARGER_CURRENT_LIMIT_UA 2000000u
+#define USB_CHARGING_ACA_RID_B_CHARGER_CURRENT_LIMIT_UA 2000000u
+#define USB_CHARGING_ACA_RID_C_CHARGER_CURRENT_LIMIT_UA 2000000u
 #define USB_CHARGING_APPLE_CHARGER_500mA_CURRENT_LIMIT_UA 500000u
 #define USB_CHARGING_APPLE_CHARGER_1000mA_CURRENT_LIMIT_UA 1000000u
 #define USB_CHARGING_APPLE_CHARGER_2000mA_CURRENT_LIMIT_UA 2000000u
@@ -414,6 +417,14 @@ struct tegra_ep {
 	unsigned stopped:1;
 };
 
+struct tegra_udc_soc_data {
+	struct tegra_utmi_config utmi;
+	bool has_hostpc;
+	bool unaligned_dma_buf_supported;
+	enum tegra_usb_phy_interface phy_intf;
+	enum tegra_usb_operation_mode op_mode;
+};
+
 enum tegra_connect_type {
 	CONNECT_TYPE_NONE,
 	CONNECT_TYPE_SDP,
@@ -425,7 +436,10 @@ enum tegra_connect_type {
 	CONNECT_TYPE_NON_STANDARD_CHARGER,
 	CONNECT_TYPE_APPLE_500MA,
 	CONNECT_TYPE_APPLE_1000MA,
-	CONNECT_TYPE_APPLE_2000MA
+	CONNECT_TYPE_APPLE_2000MA,
+	CONNECT_TYPE_ACA_NV_CHARGER,
+	CONNECT_TYPE_ACA_RID_B,
+	CONNECT_TYPE_ACA_RID_C,
 };
 
 struct tegra_udc {
@@ -452,7 +466,7 @@ struct tegra_udc {
 	enum tegra_connect_type connect_type;
 	enum tegra_connect_type prev_connect_type;
 	enum tegra_connect_type connect_type_lp0;
-	enum tegra_usb_qc2_voltage qc2_voltage;
+	u32 qc2_voltage;
 	void __iomem *regs;
 	size_t ep_qh_size;		/* size after alignment adjustment*/
 	dma_addr_t ep_qh_dma;		/* dma address of QH */
@@ -481,6 +495,13 @@ struct tegra_udc {
 	bool charging_supported;
 	struct extcon_dev *edev;
 	struct extcon_dev *vbus_extcon_dev;
+	struct extcon_cable *aca_rid_b_ecable;
+	struct extcon_cable *aca_rid_c_ecable;
+	struct extcon_cable *aca_nv_extcon_cable;
+	struct extcon_dev *aca_nv_extcon_dev;
+	bool support_aca_nv_cable;
+	bool support_aca_rid;
+	bool aca_status;
 };
 
 

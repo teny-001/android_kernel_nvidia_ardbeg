@@ -1,3 +1,8 @@
+
+/*
+ * Copyright (c) 2014-2016, NVIDIA CORPORATION.  All rights reserved.
+ */
+
 #ifndef _UAPI__LINUX_FUNCTIONFS_H__
 #define _UAPI__LINUX_FUNCTIONFS_H__
 
@@ -10,9 +15,11 @@
 
 enum {
 	FUNCTIONFS_DESCRIPTORS_MAGIC = 1,
-	FUNCTIONFS_STRINGS_MAGIC     = 2
+	FUNCTIONFS_STRINGS_MAGIC     = 2,
+	FUNCTIONFS_DESCRIPTORS_MAGIC_V2 = 3,
 };
 
+#define FUNCTIONFS_SS_DESC_MAGIC 0x0055DE5C
 
 #ifndef __KERNEL__
 
@@ -42,6 +49,20 @@ struct usb_functionfs_descs_head {
 /*
  * Descriptors format:
  *
+  * | off | name      | type         | description                          |
+ * |-----+-----------+--------------+--------------------------------------|
+ * |   0 | magic     | LE32         | FUNCTIONFS_DESCRIPTORS_MAGIC_V2      |
+ * |   4 | length    | LE32         | length of the whole data chunk       |
+ * |   8 | flags     | LE32         | combination of functionfs_flags      |
+ * |     | fs_count  | LE32         | number of full-speed descriptors     |
+ * |     | hs_count  | LE32         | number of high-speed descriptors     |
+ * |     | ss_count  | LE32         | number of super-speed descriptors    |
+ * |     | os_count  | LE32         | number of MS OS descriptors          |
+ * |     | fs_descrs | Descriptor[] | list of full-speed descriptors       |
+ * |     | hs_descrs | Descriptor[] | list of high-speed descriptors       |
+ * |     | ss_descrs | Descriptor[] | list of super-speed descriptors      |
+ * |     | os_descrs | OSDesc[]     | list of MS OS descriptors            |
+ *
  * | off | name      | type         | description                          |
  * |-----+-----------+--------------+--------------------------------------|
  * |   0 | magic     | LE32         | FUNCTIONFS_{FS,HS}_DESCRIPTORS_MAGIC |
@@ -50,7 +71,11 @@ struct usb_functionfs_descs_head {
  * |  12 | hs_count  | LE32         | number of high-speed descriptors     |
  * |  16 | fs_descrs | Descriptor[] | list of full-speed descriptors       |
  * |     | hs_descrs | Descriptor[] | list of high-speed descriptors       |
+ * |     | ss_magic  | LE32         | FUNCTIONFS_SS_DESC_MAGIC             |
+ * |     | ss_count  | LE32         | number of super-speed descriptors    |
+ * |     | ss_descrs | Descriptor[] | list of super-speed descriptors      |
  *
+ * ss_magic: if present then it implies that SS_DESCs are also present
  * descs are just valid USB descriptors and have the following format:
  *
  * | off | name            | type | description              |

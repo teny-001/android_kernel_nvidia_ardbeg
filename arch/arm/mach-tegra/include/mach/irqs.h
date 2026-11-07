@@ -2,7 +2,7 @@
  * arch/arm/mach-tegra/include/mach/irqs.h
  *
  * Copyright (C) 2010 Google, Inc.
- * Copyright (c) 2011-2013, NVIDIA CORPORATION, All rights reserved.
+ * Copyright (c) 2011-2015, NVIDIA CORPORATION, All rights reserved.
  *
  * Author:
  *	Colin Cross <ccross@google.com>
@@ -24,7 +24,8 @@
 
 #define INT_GIC_BASE			0
 
-#define IRQ_LOCALTIMER                  29
+#define nLEGACYFIQ_PPI			28
+#define IRQ_LOCALTIMER			29
 
 #ifdef CONFIG_ARCH_TEGRA_2x_SOC
 /* Primary Interrupt Controller */
@@ -173,10 +174,6 @@
 
 #define INT_GPIO_BASE			(INT_QUAD_BASE + 32)
 #define INT_GPIO_NR			(28 * 8)
-
-#define INT_PCI_MSI_BASE		(INT_GPIO_BASE + \
-					 INT_GPIO_NR)
-#define INT_PCI_MSI_NR			(0)
 
 #elif defined(CONFIG_ARCH_TEGRA_3x_SOC)
 
@@ -362,10 +359,6 @@
 
 #define INT_GPIO_BASE			(INT_QUINT_BASE + 32)
 #define INT_GPIO_NR			(32 * 8)
-
-#define INT_PCI_MSI_BASE		(INT_GPIO_BASE + \
-					 INT_GPIO_NR)
-#define INT_PCI_MSI_NR			(32 * 8)
 
 #elif defined(CONFIG_ARCH_TEGRA_11x_SOC) || defined(CONFIG_ARCH_TEGRA_14x_SOC)
 
@@ -565,10 +558,6 @@
 #define INT_GPIO_BASE			(INT_QUINT_BASE + 32)
 #define INT_GPIO_NR			(32 * 8)
 
-#define INT_PCI_MSI_BASE		(INT_GPIO_BASE + \
-					 INT_GPIO_NR)
-#define INT_PCI_MSI_NR			(32 * 8)
-
 #elif defined(CONFIG_ARCH_TEGRA_12x_SOC)
 
 /* Primary Interrupt Controller */
@@ -650,7 +639,7 @@
 #define INT_HOST1X_MPCORE_GENERAL	(INT_TRI_BASE + 3)
 #define INT_MPE_GENERAL			(INT_TRI_BASE + 4)
 #define INT_VI_GENERAL			(INT_TRI_BASE + 5)
-#define INT_EPP_GENERAL			(INT_TRI_BASE + 6)
+#define INT_ISPB_GENERAL		(INT_TRI_BASE + 6)
 #define INT_ISP_GENERAL			(INT_TRI_BASE + 7)
 #define INT_2D_GENERAL			(INT_TRI_BASE + 8)
 #define INT_DISPLAY_GENERAL		(INT_TRI_BASE + 9)
@@ -759,10 +748,8 @@
 					 INT_SYNCPT_THRESH_NR)
 #define INT_GPIO_NR			(32 * 8)
 
-#define INT_PCI_MSI_BASE		(INT_GPIO_BASE + \
-					 INT_GPIO_NR)
-#define INT_PCI_MSI_NR			(32 * 8)
-
+#elif defined(CONFIG_ARCH_TEGRA_21x_SOC)
+#include "../../../../arm64/mach-tegra/include/mach/irqs-t21x.h"
 #else
 
 /* future chips */
@@ -771,8 +758,8 @@
 
 #define FIQ_START			INT_GIC_BASE
 
-#define TEGRA_NR_IRQS			(INT_PCI_MSI_BASE + \
-							INT_PCI_MSI_NR)
+#define TEGRA_NR_IRQS			(INT_GPIO_BASE + \
+					 INT_GPIO_NR)
 
 #define INT_BOARD_BASE			TEGRA_NR_IRQS
 

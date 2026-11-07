@@ -24,62 +24,6 @@
 #include "gk20a.h"
 #include "gr_gk20a.h"
 
-#include "dev.h"
-
-static int gk20a_determine_L2_size_bytes(struct gk20a *g)
-{
-	const u32 gpuid = GK20A_GPUID(g->gpu_characteristics.arch,
-				      g->gpu_characteristics.impl);
-	u32 lts_per_ltc;
-	u32 ways;
-	u32 sets;
-	u32 bytes_per_line;
-	u32 active_ltcs;
-	u32 cache_size;
-
-	u32 tmp;
-	u32 active_sets_value;
-
-	tmp = gk20a_readl(g, ltc_ltc0_lts0_tstg_cfg1_r());
-	ways = hweight32(ltc_ltc0_lts0_tstg_cfg1_active_ways_v(tmp));
-
-	active_sets_value = ltc_ltc0_lts0_tstg_cfg1_active_sets_v(tmp);
-	if (active_sets_value == ltc_ltc0_lts0_tstg_cfg1_active_sets_all_v()) {
-		sets = 64;
-	} else if (active_sets_value ==
-		 ltc_ltc0_lts0_tstg_cfg1_active_sets_half_v()) {
-		sets = 32;
-	} else if (active_sets_value ==
-		 ltc_ltc0_lts0_tstg_cfg1_active_sets_quarter_v()) {
-		sets = 16;
-	} else {
-		dev_err(dev_from_gk20a(g),
-			"Unknown constant %u for active sets",
-		       (unsigned)active_sets_value);
-		sets = 0;
-	}
-
-	active_ltcs = g->gr.num_fbps;
-
-	/* chip-specific values */
-	switch (gpuid) {
-	case GK20A_GPUID_GK20A:
-		lts_per_ltc = 1;
-		bytes_per_line = 128;
-		break;
-
-	default:
-		dev_err(dev_from_gk20a(g), "Unknown GPU id 0x%02x\n",
-			(unsigned)gpuid);
-		lts_per_ltc = 0;
-		bytes_per_line = 0;
-	}
-
-	cache_size = active_ltcs * lts_per_ltc * ways * sets * bytes_per_line;
-
-	return cache_size;
-}
-
 /*
  * Set the maximum number of ways that can have the "EVIST_LAST" class.
  */
@@ -129,64 +73,93 @@ static void gk20a_ltc_set_zbc_depth_entry(struct gk20a *g,
 		     depth_val->depth);
 }
 
+static int gk20a_ltc_alloc_phys_cbc(struct gk20a *g,
+				    size_t compbit_backing_size)
+{
+	struct gr_gk20a *gr = &g->gr;
+
+	return gk20a_gmmu_alloc_attr(g, DMA_ATTR_FORCE_CONTIGUOUS,
+				    compbit_backing_size,
+				    &gr->compbit_store.mem);
+}
+
+static int gk20a_ltc_alloc_virt_cbc(struct gk20a *g,
+				    size_t compbit_backing_size)
+{
+	struct gr_gk20a *gr = &g->gr;
+
+	return gk20a_gmmu_alloc_attr(g, DMA_ATTR_NO_KERNEL_MAPPING,
+				    compbit_backing_size,
+				    &gr->compbit_store.mem);
+}
+
 static void gk20a_ltc_init_cbc(struct gk20a *g, struct gr_gk20a *gr)
 {
+	u32 max_size = gr->max_comptag_mem;
+	u32 max_comptag_lines = max_size << 3;
+
 	u32 compbit_base_post_divide;
 	u64 compbit_base_post_multiply64;
-	u64 compbit_store_base_iova =
-		NV_MC_SMMU_VADDR_TRANSLATE(gr->compbit_store.base_iova);
-	u64 compbit_base_post_divide64 = (compbit_store_base_iova >>
-		ltc_ltcs_ltss_cbc_base_alignment_shift_v());
+	u64 compbit_store_iova;
+	u64 compbit_base_post_divide64;
 
-	do_div(compbit_base_post_divide64, gr->num_fbps);
+	if (tegra_platform_is_linsim())
+		compbit_store_iova = gk20a_mem_phys(&gr->compbit_store.mem);
+	else
+		compbit_store_iova = g->ops.mm.get_iova_addr(g,
+				gr->compbit_store.mem.sgt->sgl, 0);
+
+	compbit_base_post_divide64 = compbit_store_iova >>
+		ltc_ltcs_ltss_cbc_base_alignment_shift_v();
+
+	do_div(compbit_base_post_divide64, g->ltc_count);
 	compbit_base_post_divide = u64_lo32(compbit_base_post_divide64);
 
 	compbit_base_post_multiply64 = ((u64)compbit_base_post_divide *
-		gr->num_fbps) << ltc_ltcs_ltss_cbc_base_alignment_shift_v();
+		g->ltc_count) << ltc_ltcs_ltss_cbc_base_alignment_shift_v();
 
-	if (compbit_base_post_multiply64 < compbit_store_base_iova)
+	if (compbit_base_post_multiply64 < compbit_store_iova)
 		compbit_base_post_divide++;
+
+	/* Bug 1477079 indicates sw adjustment on the posted divided base. */
+	if (g->ops.ltc.cbc_fix_config)
+		compbit_base_post_divide =
+			g->ops.ltc.cbc_fix_config(g, compbit_base_post_divide);
 
 	gk20a_writel(g, ltc_ltcs_ltss_cbc_base_r(),
 		compbit_base_post_divide);
 
 	gk20a_dbg(gpu_dbg_info | gpu_dbg_map | gpu_dbg_pte,
 		   "compbit base.pa: 0x%x,%08x cbc_base:0x%08x\n",
-		   (u32)(compbit_store_base_iova >> 32),
-		   (u32)(compbit_store_base_iova & 0xffffffff),
+		   (u32)(compbit_store_iova >> 32),
+		   (u32)(compbit_store_iova & 0xffffffff),
 		   compbit_base_post_divide);
+
+	gr->compbit_store.base_hw = compbit_base_post_divide;
+
+	g->ops.ltc.cbc_ctrl(g, gk20a_cbc_op_invalidate,
+			    0, max_comptag_lines - 1);
+
 }
 
-/* Flushes the compression bit cache as well as "data".
- * Note: the name here is a bit of a misnomer.  ELPG uses this
- * internally... but ELPG doesn't have to be on to do it manually.
- */
-static void gk20a_mm_g_elpg_flush_locked(struct gk20a *g)
+#ifdef CONFIG_DEBUG_FS
+static void gk20a_ltc_sync_debugfs(struct gk20a *g)
 {
-	u32 data;
-	s32 retry = 100;
+	u32 reg_f = ltc_ltcs_ltss_tstg_set_mgmt_2_l2_bypass_mode_enabled_f();
 
-	gk20a_dbg_fn("");
+	spin_lock(&g->debugfs_lock);
+	if (g->mm.ltc_enabled != g->mm.ltc_enabled_debug) {
+		u32 reg = gk20a_readl(g, ltc_ltcs_ltss_tstg_set_mgmt_2_r());
+		if (g->mm.ltc_enabled_debug)
+			/* bypass disabled (normal caching ops)*/
+			reg &= ~reg_f;
+		else
+			/* bypass enabled (no caching) */
+			reg |= reg_f;
 
-	/* Make sure all previous writes are committed to the L2. There's no
-	   guarantee that writes are to DRAM. This will be a sysmembar internal
-	   to the L2. */
-	gk20a_writel(g, ltc_ltcs_ltss_g_elpg_r(),
-		     ltc_ltcs_ltss_g_elpg_flush_pending_f());
-	do {
-		data = gk20a_readl(g, ltc_ltc0_ltss_g_elpg_r());
-
-		if (ltc_ltc0_ltss_g_elpg_flush_v(data) ==
-		    ltc_ltc0_ltss_g_elpg_flush_pending_v()) {
-			gk20a_dbg_info("g_elpg_flush 0x%x", data);
-			retry--;
-			usleep_range(20, 40);
-		} else
-			break;
-	} while (retry >= 0 || !tegra_platform_is_silicon());
-
-	if (retry < 0)
-		gk20a_warn(dev_from_gk20a(g),
-			    "g_elpg_flush too many retries");
-
+		gk20a_writel(g, ltc_ltcs_ltss_tstg_set_mgmt_2_r(), reg);
+		g->mm.ltc_enabled = g->mm.ltc_enabled_debug;
+	}
+	spin_unlock(&g->debugfs_lock);
 }
+#endif

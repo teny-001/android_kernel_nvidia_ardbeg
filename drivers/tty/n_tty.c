@@ -1369,6 +1369,12 @@ handle_newline:
 	put_tty_queue(c, ldata);
 }
 
+int n_tty_buffer_get_count(struct tty_struct *tty)
+{
+	struct n_tty_data *ldata = tty->disc_data;
+	return ldata->read_cnt;
+ }
+ EXPORT_SYMBOL(n_tty_buffer_get_count);
 
 /**
  *	n_tty_write_wakeup	-	asynchronous I/O notifier
@@ -2066,8 +2072,12 @@ static ssize_t n_tty_write(struct tty_struct *tty, struct file *file,
 			if (tty->ops->flush_chars)
 				tty->ops->flush_chars(tty);
 		} else {
+			struct n_tty_data *ldata = tty->disc_data;
+
 			while (nr > 0) {
+				mutex_lock(&ldata->output_lock);
 				c = tty->ops->write(tty, b, nr);
+				mutex_unlock(&ldata->output_lock);
 				if (c < 0) {
 					retval = c;
 					goto break_out;

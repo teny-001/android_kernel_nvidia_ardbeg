@@ -32,8 +32,11 @@
 #include <linux/sched.h>
 #include <linux/syscalls.h>
 
+#include <asm/arch_timer.h>
 #include <asm/atomic.h>
+#include <asm/barrier.h>
 #include <asm/debug-monitors.h>
+#include <asm/esr.h>
 #include <asm/traps.h>
 #include <asm/stacktrace.h>
 #include <asm/exception.h>
@@ -287,19 +290,23 @@ asmlinkage void __exception do_undefinstr(struct pt_regs *regs)
 	/* check for AArch32 breakpoint instructions */
 	if (!aarch32_break_handler(regs))
 		return;
-	if (compat_thumb_mode(regs)) {
-		if (get_user(instr, (u16 __user *)pc))
-			goto die_sig;
-		if (is_wide_instruction(instr)) {
-			u32 instr2;
-			if (get_user(instr2, (u16 __user *)pc+1))
+	if (user_mode(regs)) {
+		if (compat_thumb_mode(regs)) {
+			if (get_user(instr, (u16 __user *)pc))
 				goto die_sig;
-			instr <<= 16;
-			instr |= instr2;
+			if (is_wide_instruction(instr)) {
+				u32 instr2;
+				if (get_user(instr2, (u16 __user *)pc+1))
+					goto die_sig;
+				instr <<= 16;
+				instr |= instr2;
+			}
+		} else if (get_user(instr, (u32 __user *)pc)) {
+			goto die_sig;
 		}
-
-	} else if ((get_user(instr, (u32 __user *)pc))) {
-		goto die_sig;
+	} else {
+		/* kernel mode */
+		instr = *((u32 *)pc);
 	}
 
 	if (call_undef_hook(regs, instr) == 0)
@@ -319,6 +326,73 @@ die_sig:
 	info.si_addr  = pc;
 
 	arm64_notify_die("Oops - undefined instruction", regs, &info, 0);
+}
+
+static void cntvct_read_handler(unsigned int esr, struct pt_regs *regs)
+{
+	int rt = (esr & ESR_ELx_SYS64_ISS_RT_MASK) >> ESR_ELx_SYS64_ISS_RT_SHIFT;
+
+	isb();
+	if (rt != 31)
+		regs->regs[rt] = arch_counter_get_cntvct();
+	regs->pc += 4;
+}
+
+/*
+ * ARM32 instruction uses two RT registers to hold a 64-bit result.
+ */
+static void cntvct_read32_handler(unsigned int esr, struct pt_regs *regs)
+{
+	int rt2 = (esr & ESR_ELx_CP15_64_ISS_RT2_MASK) >> ESR_ELx_CP15_64_ISS_RT2_SHIFT;
+	int rt = (esr & ESR_ELx_CP15_64_ISS_RT_MASK) >> ESR_ELx_CP15_64_ISS_RT_SHIFT;
+	u64 val;
+
+	isb();
+	if (rt != 31) {
+		val = arch_counter_get_cntvct();
+		/* Put lower 32 bits in the Rt */
+		regs->regs[rt] = val & 0xffffffff;
+		/* Put higher 32 bits in the Rt2 */
+		regs->regs[rt2] = val >> 32;
+	}
+	regs->pc += 4;
+}
+
+static void cntfrq_read_handler(unsigned int esr, struct pt_regs *regs)
+{
+	int rt = (esr & ESR_ELx_SYS64_ISS_RT_MASK) >> ESR_ELx_SYS64_ISS_RT_SHIFT;
+
+	if (rt != 31)
+		asm volatile("mrs %0, cntfrq_el0" : "=r" (regs->regs[rt]));
+	regs->pc += 4;
+}
+
+asmlinkage void __exception do_sysinstr(unsigned int esr, struct pt_regs *regs)
+{
+	if ((esr & ESR_ELx_SYS64_ISS_SYS_OP_MASK) == ESR_ELx_SYS64_ISS_SYS_CNTVCT) {
+		cntvct_read_handler(esr, regs);
+		return;
+	} else if ((esr & ESR_ELx_SYS64_ISS_SYS_OP_MASK) == ESR_ELx_SYS64_ISS_SYS_CNTFRQ) {
+		cntfrq_read_handler(esr, regs);
+		return;
+	}
+
+	/*
+	 * CNTVCT can be accessed via 32-bit mrrc instruction while CNTFRQ
+	 * can be accessed via 32-bit mrc instruction. If VCT_ACCESS bit is
+	 * disabled, these two instructions will trigger the trap as well.
+	 */
+	if ((esr >> ESR_EL1_EC_SHIFT) == ESR_EL1_EC_CP15_64 &&
+	    (esr & ESR_ELx_CP15_64_ISS_SYS_MASK) == ESR_ELx_CP15_64_ISS_SYS_CNTVCT) {
+		cntvct_read32_handler(esr, regs);
+		return;
+	} else if ((esr >> ESR_EL1_EC_SHIFT) == ESR_EL1_EC_CP15_32 &&
+		   (esr & ESR_ELx_CP15_32_ISS_SYS_MASK) == ESR_ELx_CP15_32_ISS_SYS_CNTFRQ) {
+		cntfrq_read_handler(esr, regs);
+		return;
+	}
+
+	do_undefinstr(regs);
 }
 
 long compat_arm_syscall(struct pt_regs *regs);
@@ -451,7 +525,9 @@ misc1:0x%016lx, misc2:0x%016lx\n",
 asmlinkage void bad_mode(struct pt_regs *regs, int reason, unsigned int esr)
 {
 	siginfo_t info;
+#ifdef CONFIG_DENVER_CPU
 	unsigned long serr_status;
+#endif
 	void __user *pc = (void __user *)instruction_pointer(regs);
 	console_verbose();
 

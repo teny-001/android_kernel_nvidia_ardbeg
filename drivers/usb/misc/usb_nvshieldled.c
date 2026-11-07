@@ -1,7 +1,7 @@
 /*
  * USB LED Driver for NVIDIA Shield
  *
- * Copyright (c) 2013-2014, NVIDIA Corporation. All Rights Reserved.
+ * Copyright (c) 2013-2015, NVIDIA Corporation. All Rights Reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -23,6 +23,9 @@
 #include <linux/slab.h>
 #include <linux/reboot.h>
 #include <linux/notifier.h>
+#include <linux/of.h>
+#include <linux/sysedp.h>
+#include <linux/kobject.h>
 
 #define DRIVER_AUTHOR "Jun Yan, juyan@nvidia.com"
 #define DRIVER_DESC "NVIDIA Shield USB LED Driver"
@@ -54,7 +57,13 @@
 #define LED_NVBUTTON 0
 #define LED_TOUCH 1
 
+#define LED_MIN_BRIGHTNESS	0
+#define LED_MAX_BRIGHTNESS	255
+#define MAX_EDP_BRIGHTNESS	511
+#define NUM_EDP_STATES		11
+
 struct nvshield_led *g_dev;
+struct class_compat *nvshieldled_compat_class;
 
 static const struct usb_device_id nvshield_table[] = {
 	{ USB_DEVICE_AND_INTERFACE_INFO(VID, PID,
@@ -73,8 +82,11 @@ enum led_state {
 
 struct nvshield_led {
 	struct usb_device	*udev;
+	bool			pwm_enabled;
+	bool			nvshieldled_state;
 	unsigned char		brightness[LED_NUM];
 	enum led_state		state[LED_NUM];
+	struct sysedp_consumer	*sysedpc;
 };
 
 static unsigned char brightness_table[256] = {
@@ -151,6 +163,16 @@ static ssize_t show_brightness2(struct device *dev,
 	return sprintf(buf, "%d\n", led->brightness[LED_TOUCH]);
 }
 
+static unsigned int compute_edp_state(unsigned long brightness1,
+				unsigned long brightness2)
+{
+	unsigned long effective_brightness = brightness1 + brightness2;
+	unsigned int edp_state = (effective_brightness /
+			((MAX_EDP_BRIGHTNESS - LED_MIN_BRIGHTNESS) /
+			NUM_EDP_STATES)) - 1;
+	return edp_state;
+}
+
 static ssize_t set_brightness(struct device *dev,
 		struct device_attribute *attr,
 		const char *buf, size_t count)
@@ -158,10 +180,24 @@ static ssize_t set_brightness(struct device *dev,
 	struct usb_interface *intf = to_usb_interface(dev);
 	struct nvshield_led *led = usb_get_intfdata(intf);
 	unsigned long brightness_val;
+	unsigned int edp_state;
 
 	if (!kstrtoul(buf, 10, &brightness_val)) {
-		led->brightness[LED_NVBUTTON] = (unsigned char)brightness_val;
-		send_command(led, LED_NVBUTTON);
+		if (led->pwm_enabled)
+			led->brightness[LED_NVBUTTON] =
+					(unsigned char)brightness_val;
+		else
+			led->brightness[LED_NVBUTTON] =
+					(unsigned char)LED_MAX_BRIGHTNESS;
+		edp_state = compute_edp_state(brightness_val,
+					led->brightness[LED_TOUCH]);
+		if (edp_state > sysedp_get_state(led->sysedpc)) {
+			sysedp_set_state(led->sysedpc, edp_state);
+			send_command(led, LED_NVBUTTON);
+		} else {
+			send_command(led, LED_NVBUTTON);
+			sysedp_set_state(led->sysedpc, edp_state);
+		}
 	}
 	return count;
 }
@@ -173,10 +209,29 @@ static ssize_t set_brightness2(struct device *dev,
 	struct usb_interface *intf = to_usb_interface(dev);
 	struct nvshield_led *led = usb_get_intfdata(intf);
 	unsigned long brightness_val;
+	unsigned int edp_state;
 
 	if (!kstrtoul(buf, 10, &brightness_val)) {
-		led->brightness[LED_TOUCH] = (unsigned char)brightness_val;
-		send_command(led, LED_TOUCH);
+		if (led->pwm_enabled)
+			led->brightness[LED_TOUCH] =
+					(unsigned char)brightness_val;
+		else {
+			if (brightness_val <= 20)
+				led->brightness[LED_TOUCH] =
+					(unsigned char)LED_MIN_BRIGHTNESS;
+			else
+				led->brightness[LED_TOUCH] =
+					(unsigned char)LED_MAX_BRIGHTNESS;
+		}
+		edp_state = compute_edp_state(brightness_val,
+					led->brightness[LED_NVBUTTON]);
+		if (edp_state > sysedp_get_state(led->sysedpc)) {
+			sysedp_set_state(led->sysedpc, edp_state);
+			send_command(led, LED_TOUCH);
+		} else {
+			send_command(led, LED_TOUCH);
+			sysedp_set_state(led->sysedpc, edp_state);
+		}
 	}
 	return count;
 }
@@ -231,12 +286,64 @@ static ssize_t set_ledstate(struct device *dev, struct device_attribute *attr,
 	return count;
 }
 
-static DEVICE_ATTR(brightness, S_IRUGO | S_IWUSR,
+static ssize_t show_ledstate2(struct device *dev, struct device_attribute *attr,
+		char *buf)
+{
+	struct usb_interface *intf = to_usb_interface(dev);
+	struct nvshield_led *led = usb_get_intfdata(intf);
+
+	switch (led->state[LED_TOUCH]) {
+	case LED_NORMAL:
+		return sprintf(buf, "%s\n", LED_STATE_NORMAL);
+	case LED_BLINK:
+		return sprintf(buf, "%s\n", LED_STATE_BLINK);
+	case LED_BREATHE:
+		return sprintf(buf, "%s\n", LED_STATE_BREATHE);
+	case LED_OFF:
+		return sprintf(buf, "%s\n", LED_STATE_OFF);
+	default:
+		return sprintf(buf, LED_STATE_UNKNOW);
+	}
+}
+
+static ssize_t set_ledstate2(struct device *dev, struct device_attribute *attr,
+		const char *buf, size_t count)
+{
+	struct usb_interface *intf = to_usb_interface(dev);
+	struct nvshield_led *led = usb_get_intfdata(intf);
+	char ledstate_name[LED_STATE_MAXCHAR];
+	size_t len;
+
+	ledstate_name[sizeof(ledstate_name) - 1] = '\0';
+	strncpy(ledstate_name, buf, sizeof(ledstate_name) - 1);
+	len = strlen(ledstate_name);
+
+	if (len && ledstate_name[len - 1] == '\n')
+		ledstate_name[len - 1] = '\0';
+
+	if (!strcmp(ledstate_name, LED_STATE_NORMAL))
+		led->state[LED_TOUCH] = LED_NORMAL;
+	else if (!strcmp(ledstate_name, LED_STATE_BLINK))
+		led->state[LED_TOUCH] = LED_BLINK;
+	else if (!strcmp(ledstate_name, LED_STATE_BREATHE))
+		led->state[LED_TOUCH] = LED_BREATHE;
+	else if (!strcmp(ledstate_name, LED_STATE_OFF))
+		led->state[LED_TOUCH] = LED_OFF;
+	else
+		return count;
+
+	send_command(led, LED_TOUCH);
+	return count;
+}
+
+static DEVICE_ATTR(brightness, S_IRUGO,
 		show_brightness, set_brightness);
 static DEVICE_ATTR(state, S_IRUGO | S_IWUSR,
 		show_ledstate, set_ledstate);
 static DEVICE_ATTR(brightness2, S_IRUGO | S_IWUSR,
 		show_brightness2, set_brightness2);
+static DEVICE_ATTR(state2, S_IRUGO | S_IWUSR,
+		show_ledstate2, set_ledstate2);
 
 static int nvshieldled_reboot_callback(struct notifier_block *nb,
 		unsigned long code,
@@ -244,7 +351,9 @@ static int nvshieldled_reboot_callback(struct notifier_block *nb,
 	if (!g_dev)
 		return NOTIFY_DONE;
 	g_dev->state[LED_NVBUTTON] = LED_NORMAL;
+	g_dev->state[LED_TOUCH] = LED_NORMAL;
 	send_command(g_dev, LED_NVBUTTON);
+	send_command(g_dev, LED_TOUCH);
 	return NOTIFY_DONE;
 }
 
@@ -258,6 +367,8 @@ static int nvshieldled_probe(struct usb_interface *interface,
 	struct usb_device *udev = interface_to_usbdev(interface);
 	struct nvshield_led *dev = NULL;
 	int retval = -ENOMEM;
+	struct device_node *np;
+	char *edp_name;
 
 	dev = kzalloc(sizeof(struct nvshield_led), GFP_KERNEL);
 	if (dev == NULL) {
@@ -265,11 +376,53 @@ static int nvshieldled_probe(struct usb_interface *interface,
 		goto error_mem;
 	}
 
+	np = of_find_node_by_name(NULL, "touch-leds-pwm-rework");
+	if (np)
+		dev->pwm_enabled = of_device_is_available(np);
+
+	if (dev->pwm_enabled)
+		dev_info(&interface->dev, "Enabling LED PWM\n");
+	else
+		dev_info(&interface->dev, "Disabling LED PWM\n");
+
 	dev->udev = usb_get_dev(udev);
-	dev->state[LED_NVBUTTON] = LED_NORMAL;
-	dev->brightness[LED_NVBUTTON] = 255;
-	dev->state[LED_TOUCH] = LED_NORMAL;
-	dev->brightness[LED_TOUCH] = 255;
+	np = of_find_node_by_name(NULL, "usb_nvshield_led");
+	if (np) {
+		dev->nvshieldled_state = of_device_is_available(np);
+		if (dev->nvshieldled_state) {
+			dev->state[LED_NVBUTTON] = LED_NORMAL;
+			dev->brightness[LED_NVBUTTON] = 255;
+			dev->state[LED_TOUCH] = LED_NORMAL;
+			dev->brightness[LED_TOUCH] = 0;
+		} else {
+			dev->state[LED_NVBUTTON] = LED_OFF;
+			dev->brightness[LED_NVBUTTON] = 255;
+			dev->state[LED_TOUCH] = LED_OFF;
+			dev->brightness[LED_TOUCH] = 0;
+			send_command(dev, LED_TOUCH);
+			send_command(dev, LED_NVBUTTON);
+		}
+	} else {
+		dev->state[LED_NVBUTTON] = LED_NORMAL;
+		dev->brightness[LED_NVBUTTON] = 255;
+		dev->state[LED_TOUCH] = LED_NORMAL;
+		dev->brightness[LED_TOUCH] = 255;
+	}
+
+	if (np) {
+		if (of_property_read_string(np, "edp-consumer-name",
+						&edp_name)) {
+			dev_info(&interface->dev,
+				"property 'edp-consumer-name' missing or \
+				invalid. Setting LED EDP consumer name as \
+				'shieldled' \n");
+			dev->sysedpc = sysedp_create_consumer("shieldled",
+								"shieldled");
+		} else {
+			dev->sysedpc = sysedp_create_consumer(edp_name,
+								edp_name);
+		}
+	}
 
 	usb_set_intfdata(interface, dev);
 	g_dev = dev;
@@ -283,13 +436,46 @@ static int nvshieldled_probe(struct usb_interface *interface,
 	retval = device_create_file(&interface->dev, &dev_attr_brightness2);
 	if (retval)
 		goto error3;
+	retval = device_create_file(&interface->dev, &dev_attr_state2);
+	if (retval)
+		goto error4;
 	dev_info(&interface->dev, "Nvidia Shield LED attached\n");
+
+	retval = kobject_uevent(&interface->dev.kobj, KOBJ_CHANGE);
+	if (retval)
+		dev_info(&interface->dev, "sent uevent successfully\n");
+	else
+		dev_info(&interface->dev, "failed to send uevent\n");
 
 	retval = register_reboot_notifier(&nvshieldled_notifier);
 	if (retval)
-		goto error4;
+		goto error5;
+
+	nvshieldled_compat_class = class_compat_register("nvshieldled");
+	if (IS_ERR(nvshieldled_compat_class))
+		goto error6;
+
+	retval = class_compat_create_link(nvshieldled_compat_class,
+					&interface->dev, NULL);
+	if (retval)
+		goto error7;
+
+	retval = kobject_uevent(
+			(*(struct kobject**)nvshieldled_compat_class),
+								KOBJ_CHANGE);
+	if (retval)
+		dev_info(&interface->dev, "sent uevent successfully\n");
+	else
+		dev_info(&interface->dev, "failed to send uevent\n");
+
 	return 0;
 
+error7:
+	class_compat_unregister(nvshieldled_compat_class);
+error6:
+	unregister_reboot_notifier(&nvshieldled_notifier);
+error5:
+	device_remove_file(&interface->dev, &dev_attr_state2);
 error4:
 	device_remove_file(&interface->dev, &dev_attr_brightness2);
 error3:
@@ -314,6 +500,10 @@ static void nvshieldled_disconnect(struct usb_interface *interface)
 	device_remove_file(&interface->dev, &dev_attr_brightness);
 	device_remove_file(&interface->dev, &dev_attr_state);
 	device_remove_file(&interface->dev, &dev_attr_brightness2);
+	device_remove_file(&interface->dev, &dev_attr_state2);
+	sysedp_free_consumer(dev->sysedpc);
+
+	class_compat_unregister(nvshieldled_compat_class);
 
 	usb_set_intfdata(interface, NULL);
 	usb_put_dev(dev->udev);
@@ -324,11 +514,19 @@ static void nvshieldled_disconnect(struct usb_interface *interface)
 static int nvshieldled_suspend(struct usb_interface *interface,
 		pm_message_t notused)
 {
+	dev_info(&interface->dev, "Nvidia Shield LED suspended\n");
 	return 0;
 }
 
 static int nvshieldled_resume(struct usb_interface *interface)
 {
+	dev_info(&interface->dev, "Nvidia Shield LED resumed\n");
+	return 0;
+}
+
+static int nvshieldled_reset_resume(struct usb_interface *interface)
+{
+	dev_info(&interface->dev, "Nvidia Shield USB reset resume");
 	return 0;
 }
 
@@ -338,6 +536,7 @@ static struct usb_driver shieldled_driver = {
 	.disconnect = nvshieldled_disconnect,
 	.suspend =	nvshieldled_suspend,
 	.resume =	nvshieldled_resume,
+	.reset_resume = nvshieldled_reset_resume,
 	.id_table = nvshield_table,
 };
 

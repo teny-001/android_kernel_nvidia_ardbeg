@@ -3,7 +3,7 @@
  *
  * Tegra Graphics Init for T124 Architecture Chips
  *
- * Copyright (c) 2011-2014, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2011-2016, NVIDIA CORPORATION. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -21,28 +21,29 @@
 #include <linux/tegra-powergate.h>
 #include <linux/tegra-fuse.h>
 
-#include <mach/mc.h>
+#include <linux/platform/tegra/mc.h>
 
 #include "dev.h"
+#include "nvhost_channel.h"
 #include "nvhost_job.h"
 #include "class_ids.h"
 #include "t124.h"
-#include "vic03/vic03.h"
 #include "host1x/host1x.h"
 #include "hardware_t124.h"
 #include "syncpt_t124.h"
-#include "msenc/msenc.h"
 #include "tsec/tsec.h"
+#include "flcn/flcn.h"
 #include "vi/vi.h"
 #include "isp/isp.h"
-#include "gr3d/scale3d.h"
+#include "isp/isp_isr_v1.h"
+#include "scale_emc.h"
 #include "chip_support.h"
 #include "nvhost_scale.h"
-#include "nvhost_channel.h"
+#include "vhost/vhost.h"
 
 #include "../../../../arch/arm/mach-tegra/iomap.h"
 
-static int t124_num_alloc_channels = 0;
+#include "cg_regs.c"
 
 #define HOST_EMC_FLOOR 300000000
 #define VI_CLOCKGATE_DELAY 60
@@ -52,22 +53,7 @@ static int t124_num_alloc_channels = 0;
 #define TSEC_POWERGATE_DELAY 500
 #define HOST1X_POWERGATE_DELAY 50
 
-#define BIT64(nr) (1ULL << (nr))
-#define NVSYNCPTS_CLIENT_MANAGED_T124 ( \
-	BIT64(NVSYNCPT_DISP0_A) | BIT64(NVSYNCPT_DISP1_A) | \
-	BIT64(NVSYNCPT_DISP0_B) | BIT64(NVSYNCPT_DISP1_B) | \
-	BIT64(NVSYNCPT_DISP0_C) | BIT64(NVSYNCPT_DISP1_C) | \
-	BIT(NVSYNCPT_DISP0_D) | \
-	BIT(NVSYNCPT_DISP0_H) | BIT(NVSYNCPT_DISP1_H) | \
-	BIT64(NVSYNCPT_DSI) | \
-	BIT64(NVSYNCPT_VBLANK0) | BIT64(NVSYNCPT_VBLANK1) | \
-	BIT64(NVSYNCPT_AVP_0))
-
-/* Host1x driver matches module IDs while setting a
- * particular clock, This ID is used for EMC module.
- */
-#define TEGRA_HOST1X_EMC_MODULE_ID 75
-
+#ifdef CONFIG_ARCH_TEGRA
 static struct resource tegra_host1x04_resources[] = {
 	{
 		.start = TEGRA_HOST1X_BASE,
@@ -85,59 +71,25 @@ static struct resource tegra_host1x04_resources[] = {
 		.flags = IORESOURCE_IRQ,
 	},
 };
-
-static const char *s_syncpt_names[NV_HOST1X_SYNCPT_NB_PTS] = {
-	[NVSYNCPT_ISP_0_0]	= "ispa_memory",
-	[NVSYNCPT_ISP_0_1]	= "ispa_stats",
-	[NVSYNCPT_ISP_0_2]	= "ispa_stream",
-	[NVSYNCPT_ISP_0_3]	= "ispa_loadv",
-	[NVSYNCPT_ISP_1_0]	= "ispb_memory",
-	[NVSYNCPT_ISP_1_1]	= "ispb_stats",
-	[NVSYNCPT_ISP_1_2]	= "ispb_stream",
-	[NVSYNCPT_ISP_1_3]	= "ispb_loadv",
-	[NVSYNCPT_VI_0_0]	= "vi0_ispa",
-	[NVSYNCPT_VI_0_1]	= "vi0_ispb",
-	[NVSYNCPT_VI_0_2]	= "vi0_stream",
-	[NVSYNCPT_VI_0_3]	= "vi0_memory",
-	[NVSYNCPT_VI_0_4]	= "vi0_flash",
-	[NVSYNCPT_VI_1_0]	= "vi1_ispa",
-	[NVSYNCPT_VI_1_1]	= "vi1_ispb",
-	[NVSYNCPT_VI_1_2]	= "vi1_stream",
-	[NVSYNCPT_VI_1_3]	= "vi1_memory",
-	[NVSYNCPT_VI_1_4]	= "vi1_flash",
-	[NVSYNCPT_3D]		= "3d",
-	[NVSYNCPT_MPE]		= "mpe",
-	[NVSYNCPT_MPE_EBM_EOF]	= "mpe_ebm_eof",
-	[NVSYNCPT_MPE_WR_SAFE]	= "mpe_wr_safe",
-	[NVSYNCPT_VIC]		= "vic",
-	[NVSYNCPT_TSEC]		= "tsec",
-	[NVSYNCPT_DISP0_A]	= "disp0",
-	[NVSYNCPT_DISP1_A]	= "disp1",
-	[NVSYNCPT_AVP_0]	= "avp",
-	[NVSYNCPT_DISP0_B]	= "disp0b",
-	[NVSYNCPT_DISP1_B]	= "disp1b",
-	[NVSYNCPT_DISP0_C]	= "disp0c",
-	[NVSYNCPT_DISP1_C]	= "disp1c",
-	[NVSYNCPT_DISP0_D]	= "disp0d",
-	[NVSYNCPT_DISP0_H]	= "disp0h",
-	[NVSYNCPT_DISP1_H]	= "disp1h",
-	[NVSYNCPT_VBLANK0]	= "vblank0",
-	[NVSYNCPT_VBLANK1]	= "vblank1",
-	[NVSYNCPT_DSI]		= "dsi",
-};
+#endif
 
 static struct host1x_device_info host1x04_info = {
 	.nb_channels	= T124_NVHOST_NUMCHANNELS,
-	.nb_pts		= NV_HOST1X_SYNCPT_NB_PTS,
+	.ch_base	= 0,
+	.ch_limit	= T124_NVHOST_NUMCHANNELS,
 	.nb_mlocks	= NV_HOST1X_NB_MLOCKS,
-	.nb_bases	= NV_HOST1X_SYNCPT_NB_BASES,
-	.syncpt_names	= s_syncpt_names,
-	.client_managed	= NVSYNCPTS_CLIENT_MANAGED_T124,
+	.initialize_chip_support = nvhost_init_t124_support,
+	.nb_hw_pts	= NV_HOST1X_SYNCPT_NB_PTS,
+	.nb_pts		= NV_HOST1X_SYNCPT_NB_PTS,
+	.pts_base	= 0,
+	.pts_limit	= NV_HOST1X_SYNCPT_NB_PTS,
+	.syncpt_policy	= SYNCPT_PER_CHANNEL,
+	.nb_actmons	= 1,
 };
 
 struct nvhost_device_data t124_host1x_info = {
 	.clocks		= {{"host1x", 81600000}, {"actmon", UINT_MAX} },
-	NVHOST_MODULE_NO_POWERGATE_IDS,
+	NVHOST_MODULE_NO_POWERGATE_ID,
 	.can_powergate   = true,
 	.powergate_delay = HOST1X_POWERGATE_DELAY,
 	.private_data	= &host1x04_info,
@@ -149,14 +101,17 @@ struct nvhost_device_data t124_host1x_info = {
 static struct platform_device tegra_host1x04_device = {
 	.name		= "host1x",
 	.id		= -1,
+#ifdef CONFIG_ARCH_TEGRA
 	.resource	= tegra_host1x04_resources,
 	.num_resources	= ARRAY_SIZE(tegra_host1x04_resources),
+#endif
 	.dev            = {
 		.platform_data = &t124_host1x_info,
 	},
 };
 
 
+#ifdef CONFIG_TEGRA_GRHOST_ISP
 static struct resource isp_resources[] = {
 	{
 		.name = "regs",
@@ -168,23 +123,26 @@ static struct resource isp_resources[] = {
 
 static struct platform_device tegra_isp01b_device;
 struct nvhost_device_data t124_isp_info = {
+	.num_channels	= 1,
 	/* FIXME: control clocks from user space instead of hard-coding here */
-	.syncpts         = NV_ISP_0_SYNCPTS,
 	.moduleid        = NVHOST_MODULE_ISP,
+	.class           = NV_VIDEO_STREAMING_ISP_CLASS_ID,
 	.modulemutexes   = {NVMODMUTEX_ISP_0},
+	.devfs_name      = "isp",
 	.exclusive       = true,
 	.keepalive       = true,
-	.powergate_ids   = {TEGRA_POWERGATE_VENC, -1},
+	.powergate_id    = TEGRA_POWERGATE_VENC,
 	.can_powergate   = true,
 	.clockgate_delay = ISP_CLOCKGATE_DELAY,
 	.powergate_delay = ISP_POWERGATE_DELAY,
 	.clocks          = {
 		{"isp", UINT_MAX, 0, TEGRA_MC_CLIENT_ISP},
-		{"emc", 0, TEGRA_HOST1X_EMC_MODULE_ID},
+		{"emc", 0, NVHOST_MODULE_ID_EXTERNAL_MEMORY_CONTROLLER},
 		{"sclk", 80000000} },
 	.finalize_poweron = nvhost_isp_t124_finalize_poweron,
+	.prepare_poweroff = nvhost_isp_t124_prepare_poweroff,
+	.hw_init          = nvhost_isp_register_isr_v1,
 	.ctrl_ops         = &tegra_isp_ctrl_ops,
-	.alloc_hwctx_handler = nvhost_alloc_hwctx_handler,
 };
 static struct platform_device tegra_isp01_device = {
 	.name          = "isp",
@@ -206,23 +164,26 @@ static struct resource ispb_resources[] = {
 
 
 struct nvhost_device_data t124_ispb_info = {
+	.num_channels	= 1,
 	/* FIXME: control clocks from user space instead of hard-coding here */
-	.syncpts         = NV_ISP_1_SYNCPTS,
 	.moduleid        = (1 << 16) | NVHOST_MODULE_ISP,
+	.devfs_name      = "isp.1",
+	.class           = NV_VIDEO_STREAMING_ISPB_CLASS_ID,
 	.modulemutexes   = {NVMODMUTEX_ISP_1},
 	.exclusive       = true,
 	.keepalive       = true,
-	.powergate_ids   = {TEGRA_POWERGATE_VENC, -1},
+	.powergate_id    = TEGRA_POWERGATE_VENC,
 	.can_powergate   = true,
 	.clockgate_delay = ISP_CLOCKGATE_DELAY,
 	.powergate_delay = ISP_POWERGATE_DELAY,
 	.clocks          = {
 		{"isp", UINT_MAX, 0, TEGRA_MC_CLIENT_ISPB},
-		{"emc", 0, TEGRA_HOST1X_EMC_MODULE_ID},
+		{"emc", 0, NVHOST_MODULE_ID_EXTERNAL_MEMORY_CONTROLLER},
 		{"sclk", 80000000} },
 	.finalize_poweron = nvhost_isp_t124_finalize_poweron,
+	.prepare_poweroff = nvhost_isp_t124_prepare_poweroff,
+	.hw_init          = nvhost_isp_register_isr_v1,
 	.ctrl_ops         = &tegra_isp_ctrl_ops,
-	.alloc_hwctx_handler = nvhost_alloc_hwctx_handler,
 };
 
 static struct platform_device tegra_isp01b_device = {
@@ -235,6 +196,9 @@ static struct platform_device tegra_isp01b_device = {
 	},
 };
 
+#endif
+
+#if IS_ENABLED(CONFIG_VIDEO_TEGRA_VI) || IS_ENABLED(CONFIG_VIDEO_TEGRA)
 static struct resource vi_resources[] = {
 	{
 		.name = "regs",
@@ -244,38 +208,38 @@ static struct resource vi_resources[] = {
 	},
 };
 
-static struct platform_device tegra_vi01b_device;
 struct nvhost_device_data t124_vi_info = {
+	.num_channels	= 2,
 	/* FIXME: resolve powergating dependency with DIS */
 	/* FIXME: control clocks from user space instead of hard-coding here */
-	.syncpts          = NV_VI_0_SYNCPTS,
 	.moduleid         = NVHOST_MODULE_VI,
+	.class            = NV_VIDEO_STREAMING_VI_CLASS_ID,
 	.modulemutexes    = {NVMODMUTEX_VI_0},
+	.devfs_name       = "vi",
 	.exclusive        = true,
 	.keepalive       = true,
-	.powergate_ids    = {TEGRA_POWERGATE_VENC, -1},
+	.powergate_id     = TEGRA_POWERGATE_VENC,
 	.can_powergate    = true,
 	.clockgate_delay  = VI_CLOCKGATE_DELAY,
 	.powergate_delay  = VI_POWERGATE_DELAY,
 	.clocks           = {
-		{"vi", UINT_MAX, 0},
+		{"vi_bypass", UINT_MAX, 0},
 		{"csi", 0},
 		{"cilab", 102000000},
-		{"emc", 0, TEGRA_HOST1X_EMC_MODULE_ID},
+		{"cilcd", 102000000},
+		{"cile", 102000000},
+		{"emc", 0, NVHOST_MODULE_ID_EXTERNAL_MEMORY_CONTROLLER},
 		{"sclk", 80000000} },
-	.init             = nvhost_vi_init,
-	.deinit           = nvhost_vi_deinit,
 	.prepare_poweroff = nvhost_vi_prepare_poweroff,
 	.finalize_poweron = nvhost_vi_finalize_poweron,
 	.ctrl_ops         = &tegra_vi_ctrl_ops,
-	.reset            = nvhost_vi_reset,
-	.slave         = &tegra_vi01b_device,
-	.alloc_hwctx_handler = nvhost_alloc_hwctx_handler,
+	.reset            = nvhost_vi_reset_all,
 };
 EXPORT_SYMBOL(t124_vi_info);
 
 static struct platform_device tegra_vi01_device = {
 	.name		= "vi",
+	.id		= -1,
 	.resource	= vi_resources,
 	.num_resources	= ARRAY_SIZE(vi_resources),
 	.dev		= {
@@ -283,42 +247,7 @@ static struct platform_device tegra_vi01_device = {
 	},
 };
 
-struct nvhost_device_data t124_vib_info = {
-	/* FIXME: resolve powergating dependency with DIS */
-	/* FIXME: control clocks from user space instead of hard-coding here */
-	.syncpts          = NV_VI_1_SYNCPTS,
-	.moduleid         = (1 << 16 | NVHOST_MODULE_VI),
-	.modulemutexes    = {NVMODMUTEX_VI_1},
-	.exclusive        = true,
-	.keepalive       = true,
-	.powergate_ids    = {TEGRA_POWERGATE_VENC, -1},
-	.can_powergate    = true,
-	.clockgate_delay  = VI_CLOCKGATE_DELAY,
-	.powergate_delay  = VI_POWERGATE_DELAY,
-	.clocks           = {
-		{"vi", UINT_MAX},
-		{"csi", 0},
-		{"cilcd", 102000000},
-		{"cile", 102000000},
-		{"emc", 0, TEGRA_HOST1X_EMC_MODULE_ID},
-		{"sclk", 80000000} },
-	.init             = nvhost_vi_init,
-	.deinit           = nvhost_vi_deinit,
-	.prepare_poweroff = nvhost_vi_prepare_poweroff,
-	.finalize_poweron = nvhost_vi_finalize_poweron,
-	.ctrl_ops         = &tegra_vi_ctrl_ops,
-	.master           = &tegra_vi01_device,
-	.reset            = nvhost_vi_reset,
-	.alloc_hwctx_handler = nvhost_alloc_hwctx_handler,
-};
-
-static struct platform_device tegra_vi01b_device = {
-	.name		= "vi",
-	.id		= 1, /* .1 on the dev node */
-	.dev		= {
-		.platform_data = &t124_vib_info,
-	},
-};
+#endif
 
 static struct resource msenc_resources[] = {
 	{
@@ -330,27 +259,31 @@ static struct resource msenc_resources[] = {
 };
 
 struct nvhost_device_data t124_msenc_info = {
-	.version	= NVHOST_ENCODE_MSENC_VER(3, 1),
-	.syncpts	= {NVSYNCPT_MSENC, NVSYNCPT_MSENC_SLICE},
-	.waitbases	= {NVWAITBASE_MSENC},
+	.num_channels	= 1,
+	.version	= NVHOST_ENCODE_FLCN_VER(3, 1),
+	.modulemutexes	= {NVMODMUTEX_MSENC},
+	.devfs_name	= "msenc",
 	.class		= NV_VIDEO_ENCODE_MSENC_CLASS_ID,
 	.clocks		= {{"msenc", UINT_MAX, 0, TEGRA_MC_CLIENT_MSENC},
-			  {"emc", HOST_EMC_FLOOR, TEGRA_HOST1X_EMC_MODULE_ID} },
+			  {"emc", HOST_EMC_FLOOR,
+				NVHOST_MODULE_ID_EXTERNAL_MEMORY_CONTROLLER} },
 	NVHOST_DEFAULT_CLOCKGATE_DELAY,
 	.moduleid	= NVHOST_MODULE_MSENC,
-	.powergate_ids	= { TEGRA_POWERGATE_MPE, -1 },
+	.powergate_id	= TEGRA_POWERGATE_MPE,
 	.powergate_delay = 100,
 	.can_powergate	= true,
-	.init           = nvhost_msenc_init,
-	.deinit         = nvhost_msenc_deinit,
-	.finalize_poweron = nvhost_msenc_finalize_poweron,
+	.poweron_reset	= true,
+	.finalize_poweron = nvhost_flcn_finalize_poweron,
 	.scaling_init	= nvhost_scale_init,
 	.scaling_deinit	= nvhost_scale_deinit,
 	.actmon_regs	= HOST1X_CHANNEL_ACTMON1_REG_BASE,
 	.actmon_enabled	= true,
+	.firmware_name	= "nvhost_msenc031.fw",
+	.resource_policy = RESOURCE_PER_CHANNEL_INSTANCE,
+	.serialize	= true,
 };
 
-struct platform_device tegra_msenc03_device = {
+static struct platform_device tegra_msenc03_device = {
 	.name	       = "msenc",
 	.id	       = -1,
 	.resource      = msenc_resources,
@@ -370,22 +303,25 @@ static struct resource tsec_resources[] = {
 };
 
 struct nvhost_device_data t124_tsec_info = {
+	.num_channels	= 1,
 	.version       = NVHOST_ENCODE_TSEC_VER(1, 0),
-	.syncpts       = {NVSYNCPT_TSEC},
-	.waitbases     = {NVWAITBASE_TSEC},
 	.class         = NV_TSEC_CLASS_ID,
-	.exclusive     = true,
+	.modulemutexes = {NVMODMUTEX_TSECA},
+	.devfs_name    = "tsec",
+	.exclusive     = false,
 	.clocks	       = {{"tsec", UINT_MAX, 0, TEGRA_MC_CLIENT_TSEC},
 			 {"emc", HOST_EMC_FLOOR} },
-	NVHOST_MODULE_NO_POWERGATE_IDS,
+	NVHOST_MODULE_NO_POWERGATE_ID,
 	NVHOST_DEFAULT_CLOCKGATE_DELAY,
-	.can_powergate    = true,
+	.can_powergate   = true,
+	.poweron_reset   = true,
 	.powergate_delay = TSEC_POWERGATE_DELAY,
 	.keepalive       = true,
 	.moduleid      = NVHOST_MODULE_TSEC,
-	.init          = nvhost_tsec_init,
 	.finalize_poweron = nvhost_tsec_finalize_poweron,
 	.prepare_poweroff = nvhost_tsec_prepare_poweroff,
+	.resource_policy  = RESOURCE_PER_CHANNEL_INSTANCE,
+	.serialize        = true,
 };
 
 static struct platform_device tegra_tsec01_device = {
@@ -409,36 +345,46 @@ static struct resource vic03_resources[] = {
 };
 
 struct nvhost_device_data t124_vic_info = {
-	.syncpts		= {NVSYNCPT_VIC},
-	.modulemutexes		= {NVMODMUTEX_VIC},
-	.clocks			= {{"vic03", UINT_MAX, 0, TEGRA_MC_CLIENT_VIC},
-				  {"emc", UINT_MAX} },
-	.version = NVHOST_ENCODE_VIC_VER(3, 0),
-	NVHOST_MODULE_NO_POWERGATE_IDS,
+	.num_channels	= 1,
+	.modulemutexes	= {NVMODMUTEX_VIC},
+	.devfs_name	= "vic",
+	.clocks		= {{"vic03", UINT_MAX, 0, TEGRA_MC_CLIENT_VIC},
+			{"emc", UINT_MAX,
+				NVHOST_MODULE_ID_EXTERNAL_MEMORY_CONTROLLER},
+			{"vic_floor", 0,
+				NVHOST_MODULE_ID_CBUS_FLOOR},
+			{"emc_shared", 0,
+				NVHOST_MODULE_ID_EMC_SHARED} },
+	.version = NVHOST_ENCODE_FLCN_VER(3, 0),
 	NVHOST_DEFAULT_CLOCKGATE_DELAY,
 	.moduleid      = NVHOST_MODULE_VIC,
-	.alloc_hwctx_handler = nvhost_vic03_alloc_hwctx_handler,
+	.class                  = NV_GRAPHICS_VIC_CLASS_ID,
 	.can_powergate		= true,
+	.engine_can_cg		= true,
+	.engine_cg_regs		= t12x_vic_gating_registers,
+	.poweron_reset		= true,
 	.powergate_delay	= 500,
-	.powergate_ids		= { TEGRA_POWERGATE_VIC, -1 },
-	.init			= nvhost_vic03_init,
-	.deinit			= nvhost_vic03_deinit,
-	.alloc_hwctx_handler	= nvhost_vic03_alloc_hwctx_handler,
-	.finalize_poweron	= nvhost_vic03_finalize_poweron,
-	.prepare_poweroff	= nvhost_vic03_prepare_poweroff,
-	.scaling_init		= nvhost_scale3d_init,
-	.scaling_deinit		= nvhost_scale3d_deinit,
+	.powergate_id		= TEGRA_POWERGATE_VIC,
+	.finalize_poweron	= nvhost_vic_finalize_poweron,
+	.scaling_init		= nvhost_scale_emc_init,
+	.scaling_deinit		= nvhost_scale_emc_deinit,
 	.busy			= nvhost_scale_notify_busy,
 	.idle			= nvhost_scale_notify_idle,
-	.suspend_ndev		= nvhost_scale3d_suspend,
-	.scaling_post_cb	= &nvhost_scale3d_callback,
+	.scaling_post_cb	= &nvhost_scale_emc_callback,
 	.devfreq_governor	= "nvhost_podgov",
 	.actmon_regs		= HOST1X_CHANNEL_ACTMON2_REG_BASE,
 	.actmon_enabled		= true,
 	.linear_emc		= true,
+	.serialize		= true,
+	.push_work_done		= true,
+	.firmware_name		= "vic03_ucode.bin",
+	.aggregate_constraints	= nvhost_vic_aggregate_constraints,
+	.num_ppc		= 2,
+	.resource_policy	= RESOURCE_PER_CHANNEL_INSTANCE,
+	.serialize		= true,
 };
 
-struct platform_device tegra_vic03_device = {
+static struct platform_device tegra_vic03_device = {
 	.name	       = "vic03",
 	.num_resources = 1,
 	.resource      = vic03_resources,
@@ -452,169 +398,45 @@ struct platform_device tegra_vic03_device = {
  * T132 overrides for platform data.
  */
 
-struct nvhost_device_data t132_isp_info = {
-	/* FIXME: control clocks from user space instead of hard-coding here */
-	.syncpts         = NV_ISP_0_SYNCPTS,
-	.moduleid        = NVHOST_MODULE_ISP,
-	.modulemutexes   = {NVMODMUTEX_ISP_0},
-	.exclusive       = true,
-	.keepalive       = true,
-	.powergate_ids   = {TEGRA_POWERGATE_VENC, -1},
-	.can_powergate   = true,
-	.clockgate_delay = ISP_CLOCKGATE_DELAY,
-	.powergate_delay = ISP_POWERGATE_DELAY,
-	.clocks          = {
-		{"isp", UINT_MAX, 0, TEGRA_MC_CLIENT_ISP},
-		{"emc", 0, TEGRA_HOST1X_EMC_MODULE_ID} },
-	.finalize_poweron = nvhost_isp_t124_finalize_poweron,
-	.ctrl_ops         = &tegra_isp_ctrl_ops,
-};
-
-struct nvhost_device_data t132_ispb_info = {
-	/* FIXME: control clocks from user space instead of hard-coding here */
-	.syncpts         = NV_ISP_1_SYNCPTS,
-	.moduleid        = (1 << 16) | NVHOST_MODULE_ISP,
-	.modulemutexes   = {NVMODMUTEX_ISP_1},
-	.exclusive       = true,
-	.keepalive       = true,
-	.powergate_ids   = {TEGRA_POWERGATE_VENC, -1},
-	.can_powergate   = true,
-	.clockgate_delay = ISP_CLOCKGATE_DELAY,
-	.powergate_delay = ISP_POWERGATE_DELAY,
-	.clocks          = {
-		{"isp", UINT_MAX, 0, TEGRA_MC_CLIENT_ISPB},
-		{"emc", 0, TEGRA_HOST1X_EMC_MODULE_ID} },
-	.finalize_poweron = nvhost_isp_t124_finalize_poweron,
-	.ctrl_ops         = &tegra_isp_ctrl_ops,
-};
-
-struct nvhost_device_data t132_vi_info = {
-	/* FIXME: resolve powergating dependency with DIS */
-	/* FIXME: control clocks from user space instead of hard-coding here */
-	.syncpts          = NV_VI_0_SYNCPTS,
-	.moduleid         = NVHOST_MODULE_VI,
-	.modulemutexes    = {NVMODMUTEX_VI_0},
-	.exclusive        = true,
-	.keepalive       = true,
-	.powergate_ids    = {TEGRA_POWERGATE_VENC, -1},
-	.can_powergate    = true,
-	.clockgate_delay  = VI_CLOCKGATE_DELAY,
-	.powergate_delay  = VI_POWERGATE_DELAY,
-	.clocks           = {
-		{"vi", UINT_MAX, 0},
-		{"csi", 0},
-		{"cilab", 102000000},
-		{"emc", 0, TEGRA_HOST1X_EMC_MODULE_ID} },
-	.init             = nvhost_vi_init,
-	.deinit           = nvhost_vi_deinit,
-	.prepare_poweroff = nvhost_vi_prepare_poweroff,
-	.finalize_poweron = nvhost_vi_finalize_poweron,
-	.ctrl_ops         = &tegra_vi_ctrl_ops,
-	.reset            = nvhost_vi_reset,
-	.slave         = &tegra_vi01b_device,
-};
-
-struct nvhost_device_data t132_vib_info = {
-	/* FIXME: resolve powergating dependency with DIS */
-	/* FIXME: control clocks from user space instead of hard-coding here */
-	.syncpts          = NV_VI_1_SYNCPTS,
-	.moduleid         = (1 << 16 | NVHOST_MODULE_VI),
-	.modulemutexes    = {NVMODMUTEX_VI_1},
-	.exclusive        = true,
-	.keepalive       = true,
-	.powergate_ids    = {TEGRA_POWERGATE_VENC, -1},
-	.can_powergate    = true,
-	.clockgate_delay  = VI_CLOCKGATE_DELAY,
-	.powergate_delay  = VI_POWERGATE_DELAY,
-	.clocks           = {
-		{"vi", UINT_MAX},
-		{"csi", 0},
-		{"cilcd", 102000000},
-		{"cile", 102000000},
-		{"emc", 0, TEGRA_HOST1X_EMC_MODULE_ID} },
-	.init             = nvhost_vi_init,
-	.deinit           = nvhost_vi_deinit,
-	.prepare_poweroff = nvhost_vi_prepare_poweroff,
-	.finalize_poweron = nvhost_vi_finalize_poweron,
-	.ctrl_ops         = &tegra_vi_ctrl_ops,
-	.master           = &tegra_vi01_device,
-	.reset            = nvhost_vi_reset,
-};
-
-struct nvhost_device_data t132_msenc_info = {
-	.version	= NVHOST_ENCODE_MSENC_VER(3, 1),
-	.syncpts	= {NVSYNCPT_MSENC, NVSYNCPT_MSENC_SLICE},
-	.waitbases	= {NVWAITBASE_MSENC},
+static struct nvhost_device_data t132_msenc_info = {
+	.num_channels	= 1,
+	.devfs_name     = "msenc",
+	.version	= NVHOST_ENCODE_FLCN_VER(3, 1),
+	.modulemutexes	= {NVMODMUTEX_MSENC},
 	.class		= NV_VIDEO_ENCODE_MSENC_CLASS_ID,
 	.clocks		= {{"msenc", UINT_MAX, 0, TEGRA_MC_CLIENT_MSENC},
-			  {"emc", HOST_EMC_FLOOR, TEGRA_HOST1X_EMC_MODULE_ID} },
+			  {"emc", HOST_EMC_FLOOR,
+				NVHOST_MODULE_ID_EXTERNAL_MEMORY_CONTROLLER} },
 	NVHOST_DEFAULT_CLOCKGATE_DELAY,
 	.moduleid	= NVHOST_MODULE_MSENC,
-	.powergate_ids	= { TEGRA_POWERGATE_MPE, -1 },
+	.powergate_id	= TEGRA_POWERGATE_MPE,
 	.powergate_delay = 100,
 	.can_powergate	= true,
-	.init           = nvhost_msenc_init,
-	.deinit         = nvhost_msenc_deinit,
-	.finalize_poweron = nvhost_msenc_finalize_poweron,
+	.poweron_reset	= true,
+	.finalize_poweron = nvhost_flcn_finalize_poweron,
+	.firmware_name	= "nvhost_msenc031.fw",
+	.resource_policy = RESOURCE_PER_CHANNEL_INSTANCE,
+	.serialize	= true,
 };
-
-struct nvhost_device_data t132_tsec_info = {
-	.version       = NVHOST_ENCODE_TSEC_VER(1, 0),
-	.syncpts       = {NVSYNCPT_TSEC},
-	.waitbases     = {NVWAITBASE_TSEC},
-	.class         = NV_TSEC_CLASS_ID,
-	.exclusive     = true,
-	.clocks	       = {{"tsec", UINT_MAX, 0, TEGRA_MC_CLIENT_TSEC},
-			 {"emc", HOST_EMC_FLOOR} },
-	NVHOST_MODULE_NO_POWERGATE_IDS,
-	NVHOST_DEFAULT_CLOCKGATE_DELAY,
-	.moduleid      = NVHOST_MODULE_TSEC,
-	.init          = nvhost_tsec_init,
-	.finalize_poweron = nvhost_tsec_finalize_poweron,
-};
-
-#ifdef CONFIG_ARCH_TEGRA_VIC
-struct nvhost_device_data t132_vic_info = {
-	.syncpts		= {NVSYNCPT_VIC},
-	.modulemutexes		= {NVMODMUTEX_VIC},
-	.clocks			= {{"vic03", UINT_MAX, 0, TEGRA_MC_CLIENT_VIC},
-				  {"emc", UINT_MAX} },
-	.version = NVHOST_ENCODE_VIC_VER(3, 0),
-	NVHOST_MODULE_NO_POWERGATE_IDS,
-	NVHOST_DEFAULT_CLOCKGATE_DELAY,
-	.moduleid      = NVHOST_MODULE_VIC,
-	.alloc_hwctx_handler = nvhost_vic03_alloc_hwctx_handler,
-	.powergate_delay	= 500,
-	.powergate_ids		= { TEGRA_POWERGATE_VIC, -1 },
-	.init			= nvhost_vic03_init,
-	.deinit			= nvhost_vic03_deinit,
-	.alloc_hwctx_handler	= nvhost_vic03_alloc_hwctx_handler,
-	.finalize_poweron	= nvhost_vic03_finalize_poweron,
-	.prepare_poweroff	= nvhost_vic03_prepare_poweroff,
-};
-#endif
 
 static struct {
 	struct nvhost_device_data *from;
 	struct nvhost_device_data *to;
 } t132_override[] = {
-	{&t124_isp_info, &t132_isp_info},
-	{&t124_ispb_info, &t132_ispb_info},
-	{&t124_vi_info, &t132_vi_info},
 	{&t124_msenc_info, &t132_msenc_info},
-	{&t124_tsec_info, &t132_tsec_info},
-#if defined(CONFIG_ARCH_TEGRA_VIC)
-	{&t124_vic_info, &t132_vic_info},
-#endif
 };
 
 static struct platform_device *t124_devices[] = {
+#ifdef CONFIG_TEGRA_GRHOST_ISP
 	&tegra_isp01_device,
 	&tegra_isp01b_device,
+#endif
+#if IS_ENABLED(CONFIG_VIDEO_TEGRA_VI) || IS_ENABLED(CONFIG_VIDEO_TEGRA)
 	&tegra_vi01_device,
+#endif
 	&tegra_msenc03_device,
 	&tegra_tsec01_device,
-#if defined(CONFIG_ARCH_TEGRA_VIC)
+#ifdef CONFIG_ARCH_TEGRA_VIC
 	&tegra_vic03_device,
 #endif
 };
@@ -643,31 +465,16 @@ struct platform_device *tegra12_register_host1x_devices(void)
 
 #include "host1x/host1x_channel.c"
 
-static void t124_free_nvhost_channel(struct nvhost_channel *ch)
+static void t124_set_nvhost_chanops(struct nvhost_channel *ch)
 {
-	nvhost_dbg_fn("");
-	nvhost_free_channel_internal(ch, &t124_num_alloc_channels);
-}
-
-static struct nvhost_channel *t124_alloc_nvhost_channel(
-		struct platform_device *dev)
-{
-	struct nvhost_device_data *pdata = nvhost_get_devdata(dev);
-	struct nvhost_channel *ch;
-	nvhost_dbg_fn("");
-	ch = nvhost_alloc_channel_internal(pdata->index,
-		nvhost_get_host(dev)->info.nb_channels,
-		&t124_num_alloc_channels);
 	if (ch)
 		ch->ops = host1x_channel_ops;
-	return ch;
 }
 
 int nvhost_init_t124_channel_support(struct nvhost_master *host,
        struct nvhost_chip_support *op)
 {
-	op->nvhost_dev.alloc_nvhost_channel = t124_alloc_nvhost_channel;
-	op->nvhost_dev.free_nvhost_channel = t124_free_nvhost_channel;
+	op->nvhost_dev.set_nvhost_chanops = t124_set_nvhost_chanops;
 
 	return 0;
 }
@@ -675,7 +482,7 @@ int nvhost_init_t124_channel_support(struct nvhost_master *host,
 static void t124_remove_support(struct nvhost_chip_support *op)
 {
 	kfree(op->priv);
-	op->priv = 0;
+	op->priv = NULL;
 }
 
 #include "host1x/host1x_cdma.c"
@@ -689,10 +496,14 @@ int nvhost_init_t124_support(struct nvhost_master *host,
 {
 	int i = 0;
 	int err;
-	struct t124 *t124 = 0;
+	struct t124 *t124 = NULL;
+	struct nvhost_device_data *data = platform_get_drvdata(host->dev);
 
-	for (i = NVSYNCPT_GK20A_BASE; i <= NVSYNCPT_GK20A_LAST; i++)
-		s_syncpt_names[i] = "gk20a";
+	/* Select the soc name */
+	if (tegra_get_chipid() == TEGRA_CHIPID_TEGRA12)
+		op->soc_name = "tegra12x";
+	else
+		op->soc_name = "tegra13x";
 
 	/* don't worry about cleaning up on failure... "remove" does it. */
 	err = nvhost_init_t124_channel_support(host, op);
@@ -706,6 +517,15 @@ int nvhost_init_t124_support(struct nvhost_master *host,
 	op->syncpt = host1x_syncpt_ops;
 	op->intr = host1x_intr_ops;
 	op->actmon = host1x_actmon_ops;
+
+
+	if (nvhost_dev_is_virtual(host->dev)) {
+		data->can_powergate = false;
+		vhost_init_host1x_syncpt_ops(&op->syncpt);
+		vhost_init_host1x_intr_ops(&op->intr);
+		vhost_init_host1x_cdma_ops(&op->cdma);
+		vhost_init_host1x_debug_ops(&op->debug);
+	}
 
 	t124 = kzalloc(sizeof(struct t124), GFP_KERNEL);
 	if (!t124) {
@@ -732,7 +552,7 @@ int nvhost_init_t124_support(struct nvhost_master *host,
 err:
 	kfree(t124);
 
-	op->priv = 0;
-	op->remove_support = 0;
+	op->priv = NULL;
+	op->remove_support = NULL;
 	return err;
 }

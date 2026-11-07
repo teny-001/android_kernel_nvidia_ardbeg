@@ -40,6 +40,7 @@ static void oz_def_app_stop(struct oz_pd *pd, int pause);
 static void oz_def_app_rx(struct oz_pd *pd, struct oz_elt *elt);
 static void oz_pd_free(struct work_struct *work);
 static void oz_pd_uevent_workitem(struct work_struct *work);
+extern struct completion oz_pd_done;
 /*------------------------------------------------------------------------------
  * Counts the uncompleted isoc frames submitted to netcard.
  */
@@ -161,7 +162,7 @@ void oz_pd_get(struct oz_pd *pd)
  */
 void oz_pd_put(struct oz_pd *pd)
 {
-	if(atomic_read(&pd->ref_count) <= 0) {
+	if (atomic_read(&pd->ref_count) <= 0) {
 		WARN(1, "Unexpected ref_count decrement!\n");
 		return;
 	}
@@ -203,7 +204,6 @@ struct oz_pd *oz_pd_alloc(const u8 *mac_addr)
 		hrtimer_init(&pd->timeout, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 		pd->heartbeat.function = oz_pd_heartbeat_event;
 		pd->timeout.function = oz_pd_timeout_event;
-		pd->reset_retry = 0;
 
 		spin_lock_init(&pd->pd_destroy_lock);
 		pd->pd_destroy_scheduled = false;
@@ -269,6 +269,7 @@ static void oz_pd_free(struct work_struct *work)
 	}
 
 	kfree(pd);
+	complete(&oz_pd_done);
 }
 
 
@@ -353,6 +354,7 @@ int oz_services_start(struct oz_pd *pd, u16 apps, int resume)
 }
 /*------------------------------------------------------------------------------
  * Context: softirq or process
+ * Caller responsible for holding g_polling_lock
  */
 void oz_services_stop(struct oz_pd *pd, u16 apps, int pause)
 {
@@ -362,14 +364,12 @@ void oz_services_stop(struct oz_pd *pd, u16 apps, int pause)
 		apps |= 1<<OZ_APPID_SERIAL;
 	for (ai = g_app_if; ai < &g_app_if[OZ_APPID_MAX]; ai++) {
 		if (apps & (1<<ai->app_id)) {
-			oz_polling_lock_bh();
 			if (pause) {
 				pd->paused_apps |= (1<<ai->app_id);
 			} else {
 				pd->total_apps &= ~(1<<ai->app_id);
 				pd->paused_apps &= ~(1<<ai->app_id);
 			}
-			oz_polling_unlock_bh();
 			if (ai->stop)
 				ai->stop(pd, pause);
 		}
@@ -402,30 +402,38 @@ void oz_pd_heartbeat(struct oz_pd *pd, u16 apps)
 void oz_pd_stop(struct oz_pd *pd)
 {
 	u16 stop_apps = 0;
-	oz_trace_msg(M, "oz_pd_stop() State = 0x%x\n", pd->state);
 	oz_polling_lock_bh();
+	if (pd == NULL) {
+		oz_polling_unlock_bh();
+		return;
+	}
+	oz_trace_msg(M, "oz_pd_stop() State = 0x%x\n", pd->state);
+	if (pd->state == OZ_PD_S_STOPPED) {
+		pr_info("%s: pd already stopped, return\n", __func__);
+		oz_polling_unlock_bh();
+		return;
+	}
 	oz_pd_indicate_farewells(pd);
+	oz_pd_set_state(pd, OZ_PD_S_STOPPED);
 	stop_apps = pd->total_apps;
 	pd->total_apps = 0;
 	pd->paused_apps = 0;
-	oz_polling_unlock_bh();
 	oz_services_stop(pd, stop_apps, 0);
-	oz_polling_lock_bh();
-	oz_pd_set_state(pd, OZ_PD_S_STOPPED);
 
 	if (hrtimer_active(&pd->timeout)) {
-		pr_info("hrtimer timeout active\n");
+		oz_trace_msg(M, "hrtimer timeout active\n");
 		hrtimer_cancel(&pd->timeout);
 	}
 	if (hrtimer_active(&pd->heartbeat)) {
-		pr_info("hrtimer heartbeat active\n");
+		oz_trace_msg(M, "hrtimer heartbeat active\n");
 		hrtimer_cancel(&pd->heartbeat);
 	}
 	/* connect_req will restart timers */
 
-	/* Remove from PD list.*/
-	list_del(&pd->link);
-
+	if (list_empty(&pd->link))
+		WARN(1, "pd list is empty! something went wrong\n");
+	else /* Remove from PD list.*/
+		list_del(&pd->link);
 
 	oz_polling_unlock_bh();
 	oz_trace_msg(M, "pd ref count = %d\n", atomic_read(&pd->ref_count));
@@ -452,11 +460,13 @@ int oz_pd_sleep(struct oz_pd *pd)
 		do_stop = 1;
 	}
 	stop_apps = pd->total_apps;
-	oz_polling_unlock_bh();
 	if (do_stop) {
+		oz_polling_unlock_bh();
+		pr_info("%s: disconnect requested from device\n", __func__);
 		oz_pd_stop(pd);
 	} else {
 		oz_services_stop(pd, stop_apps, 1);
+		oz_polling_unlock_bh();
 		oz_timer_add(pd, OZ_TIMER_STOP, pd->keep_alive);
 	}
 	return do_stop;
@@ -582,7 +592,6 @@ static struct sk_buff *oz_build_frame(struct oz_pd *pd, struct oz_tx_frame *f)
 	skb_reset_network_header(skb);
 	skb->dev = dev;
 	skb->protocol = htons(OZ_ETHERTYPE);
-	skb->priority = AC_VO;
 	if (dev_hard_header(skb, dev, OZ_ETHERTYPE, pd->mac_addr,
 		dev->dev_addr, skb->len) < 0)
 		goto fail;
@@ -657,6 +666,11 @@ static int oz_send_next_queued_frame(struct oz_pd *pd, int more_data)
 		oz_set_last_pkt_nb(pd, skb);
 		if ((int)atomic_read(&g_submitted_isoc) <
 							OZ_MAX_SUBMITTED_ISOC) {
+			if (!netif_running(skb->dev)) {
+				kfree_skb(skb);
+				return -1;
+			}
+
 			oz_trace_skb(skb, 'T');
 			if (dev_queue_xmit(skb) < 0) {
 				return -1;
@@ -677,6 +691,12 @@ static int oz_send_next_queued_frame(struct oz_pd *pd, int more_data)
 
 	if (more_data)
 		oz_set_more_bit(skb);
+
+	if (!netif_running(skb->dev)) {
+		kfree_skb(skb);
+		return -1;
+	}
+
 	oz_trace_skb(skb, 'T');
 	if (dev_queue_xmit(skb) < 0)
 		return -1;
@@ -765,8 +785,12 @@ static int oz_send_isoc_frame(struct oz_pd *pd)
 		memcpy(elt, ei->data, ei->length);
 		elt = oz_next_elt(elt);
 	}
-	oz_trace_skb(skb, 'T');
-	dev_queue_xmit(skb);
+
+	if (netif_running(skb->dev)) {
+		oz_trace_skb(skb, 'T');
+		dev_queue_xmit(skb);
+	} else
+		kfree_skb(skb);
 	oz_elt_info_free_chain(&pd->elt_buff, &list);
 	return 0;
 }
@@ -979,6 +1003,10 @@ int oz_send_isoc_unit(struct oz_pd *pd, u8 ep_num, const u8 *data, int len)
 		if (atomic_read(&g_submitted_isoc) < OZ_MAX_SUBMITTED_ISOC) {
 			atomic_inc(&g_submitted_isoc);
 			oz_trace_skb(skb, 'T');
+
+			if (!netif_running(skb->dev))
+				goto out;
+
 			if (dev_queue_xmit(skb) < 0) {
 				return -1;
 			} else

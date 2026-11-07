@@ -20,6 +20,7 @@
 #include <linux/cdev.h>
 #include <linux/slab.h>
 #include <linux/poll.h>
+#include <linux/sched.h>
 
 #include <linux/iio/iio.h>
 #include "iio_core.h"
@@ -53,7 +54,17 @@ ssize_t iio_buffer_read_first_n_outer(struct file *filp, char __user *buf,
 				      size_t n, loff_t *f_ps)
 {
 	struct iio_dev *indio_dev = filp->private_data;
-	struct iio_buffer *rb = indio_dev->buffer;
+	struct iio_buffer *rb;
+	unsigned long flags;
+
+	spin_lock_irqsave(&indio_dev->dc_lock, flags);
+	if (test_bit(IIO_DISCONNECTING_BIT_POS, &indio_dev->flags)) {
+		spin_unlock_irqrestore(&indio_dev->dc_lock, flags);
+		return -ENODEV;
+	}
+	spin_unlock_irqrestore(&indio_dev->dc_lock, flags);
+
+	rb = indio_dev->buffer;
 
 	if (!rb || !rb->access->read_first_n)
 		return -EINVAL;
@@ -67,13 +78,45 @@ unsigned int iio_buffer_poll(struct file *filp,
 			     struct poll_table_struct *wait)
 {
 	struct iio_dev *indio_dev = filp->private_data;
-	struct iio_buffer *rb = indio_dev->buffer;
+	struct iio_buffer *rb;
+	unsigned long flags;
+
+	spin_lock_irqsave(&indio_dev->dc_lock, flags);
+	if (test_bit(IIO_DISCONNECTING_BIT_POS, &indio_dev->flags)) {
+		spin_unlock_irqrestore(&indio_dev->dc_lock, flags);
+		return POLLERR | POLLHUP;
+	}
+	spin_unlock_irqrestore(&indio_dev->dc_lock, flags);
+
+	rb = indio_dev->buffer;
+
+	if (!indio_dev->info)
+		return POLLERR | POLLHUP;
 
 	poll_wait(filp, &rb->pollq, wait);
+
+	if (!indio_dev->info)
+		return POLLERR | POLLHUP;
+
 	if (rb->stufftoread)
 		return POLLIN | POLLRDNORM;
 	/* need a way of knowing if there may be enough data... */
 	return 0;
+}
+
+/**
+ * iio_buffer_wakeup_poll - Wakes up the buffer waitqueue
+ * @indio_dev: The IIO device
+ *
+ * Wakes up the event waitqueue used for poll(). Should usually
+ * be called when the device is unregistered.
+ */
+void iio_buffer_wakeup_poll(struct iio_dev *indio_dev)
+{
+	if (!indio_dev->buffer)
+		return;
+
+	wake_up(&indio_dev->buffer->pollq);
 }
 
 void iio_buffer_init(struct iio_buffer *buffer)
@@ -119,7 +162,8 @@ static ssize_t iio_scan_el_show(struct device *dev,
 	int ret;
 	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
 
-	ret = test_bit(to_iio_dev_attr(attr)->address,
+	/* Ensure ret is 0 or 1. */
+	ret = !!test_bit(to_iio_dev_attr(attr)->address,
 		       indio_dev->buffer->scan_mask);
 
 	return sprintf(buf, "%d\n", ret);
@@ -490,7 +534,7 @@ int iio_update_buffers(struct iio_dev *indio_dev,
 		indio_dev->active_scan_mask = NULL;
 
 	if (remove_buffer)
-		list_del(&remove_buffer->buffer_list);
+		list_del_init(&remove_buffer->buffer_list);
 	if (insert_buffer)
 		list_add(&insert_buffer->buffer_list, &indio_dev->buffer_list);
 
@@ -527,7 +571,7 @@ int iio_update_buffers(struct iio_dev *indio_dev,
 			 * Roll back.
 			 * Note can only occur when adding a buffer.
 			 */
-			list_del(&insert_buffer->buffer_list);
+			list_del_init(&insert_buffer->buffer_list);
 			indio_dev->active_scan_mask = old_mask;
 			success = -EINVAL;
 		}
@@ -613,7 +657,7 @@ error_run_postdisable:
 error_remove_inserted:
 
 	if (insert_buffer)
-		list_del(&insert_buffer->buffer_list);
+		list_del_init(&insert_buffer->buffer_list);
 	indio_dev->active_scan_mask = old_mask;
 	kfree(compound_mask);
 error_ret:
@@ -762,7 +806,8 @@ int iio_scan_mask_query(struct iio_dev *indio_dev,
 	if (!buffer->scan_mask)
 		return 0;
 
-	return test_bit(bit, buffer->scan_mask);
+	/* Ensure return value is 0 or 1. */
+	return !!test_bit(bit, buffer->scan_mask);
 };
 EXPORT_SYMBOL_GPL(iio_scan_mask_query);
 
@@ -847,7 +892,7 @@ static int iio_buffer_update_demux(struct iio_dev *indio_dev,
 
 	/* Now we have the two masks, work from least sig and build up sizes */
 	for_each_set_bit(out_ind,
-			 indio_dev->active_scan_mask,
+			 buffer->scan_mask,
 			 indio_dev->masklength) {
 		in_ind = find_next_bit(indio_dev->active_scan_mask,
 				       indio_dev->masklength,

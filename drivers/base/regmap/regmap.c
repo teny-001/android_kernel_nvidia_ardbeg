@@ -17,6 +17,7 @@
 #include <linux/err.h>
 #include <linux/rbtree.h>
 #include <linux/sched.h>
+#include <linux/of.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/regmap.h>
@@ -114,7 +115,7 @@ bool regmap_readable(struct regmap *map, unsigned int reg)
 
 bool regmap_volatile(struct regmap *map, unsigned int reg)
 {
-	if (!regmap_readable(map, reg))
+	if (!map->format.format_write && !regmap_readable(map, reg))
 		return false;
 
 	if (map->volatile_reg)
@@ -302,13 +303,16 @@ static void regmap_unlock_mutex(void *__map)
 static void regmap_lock_spinlock(void *__map)
 {
 	struct regmap *map = __map;
-	spin_lock(&map->spinlock);
+	unsigned long flags;
+
+	spin_lock_irqsave(&map->spinlock, flags);
+	map->spinlock_flags = flags;
 }
 
 static void regmap_unlock_spinlock(void *__map)
 {
 	struct regmap *map = __map;
-	spin_unlock(&map->spinlock);
+	spin_unlock_irqrestore(&map->spinlock, map->spinlock_flags);
 }
 
 static void dev_get_regmap_release(struct device *dev, void *res)
@@ -1179,7 +1183,7 @@ int _regmap_write(struct regmap *map, unsigned int reg,
 	}
 
 #ifdef LOG_DEVICE
-	if (strcmp(dev_name(map->dev), LOG_DEVICE) == 0)
+	if (map->dev && strcmp(dev_name(map->dev), LOG_DEVICE) == 0)
 		dev_info(map->dev, "%x <= %x\n", reg, val);
 #endif
 
@@ -1439,7 +1443,7 @@ static int _regmap_read(struct regmap *map, unsigned int reg,
 	ret = map->reg_read(context, reg, val);
 	if (ret == 0) {
 #ifdef LOG_DEVICE
-		if (strcmp(dev_name(map->dev), LOG_DEVICE) == 0)
+		if (map->dev && strcmp(dev_name(map->dev), LOG_DEVICE) == 0)
 			dev_info(map->dev, "%x => %x\n", reg, *val);
 #endif
 
@@ -1496,7 +1500,7 @@ int regmap_raw_read(struct regmap *map, unsigned int reg, void *val,
 	size_t val_bytes = map->format.val_bytes;
 	size_t val_count = val_len / val_bytes;
 	unsigned int v;
-	int ret, i;
+	int ret = -EINVAL, i;
 
 	if (!map->bus)
 		return -EINVAL;
@@ -1588,7 +1592,7 @@ int regmap_bulk_read(struct regmap *map, unsigned int reg, void *val,
 					  &ival);
 			if (ret != 0)
 				return ret;
-			memcpy(val + (i * val_bytes), &ival, val_bytes);
+			map->format.format_val(val + (i * val_bytes), ival, 0);
 		}
 	}
 
@@ -1794,6 +1798,63 @@ out:
 	return ret;
 }
 EXPORT_SYMBOL_GPL(regmap_register_patch);
+
+/**
+ * regmap_system_prod_config: Configure device with system specific config
+ *		provided from DT.
+ *
+ * @dev: Device pointer.
+ * @map: Register map to apply updates to.
+ * @config_np_name: Config node name.
+ */
+int regmap_system_prod_config(struct device *dev, struct regmap **map,
+	const char *config_np_name)
+{
+	struct device_node *dev_node = dev->of_node;
+	struct device_node *np;
+	int ncount, i;
+	int ret;
+
+	if (!dev_node || !config_np_name) {
+		dev_err(dev, "Paramaters are not valid\n");
+		return -ENODEV;
+	}
+
+	np = of_find_node_by_name(dev_node, config_np_name);
+	if (!np) {
+		dev_info(dev, "Node %s does not have sub-node %s\n",
+			dev_node->name, config_np_name);
+		return 0;
+	}
+
+	ncount = of_property_count_u32(np, "config");
+	if ((ncount < 4) || (ncount % 4 != 0)) {
+		dev_info(dev, "Node %s, prop %s does not have correct data\n",
+			np->name, "config");
+		return -EINVAL;
+	}
+
+	ncount /=  4;
+	for (i = 0; i < ncount; ++i) {
+		u32 index, mask, val, reg;
+
+		of_property_read_u32_index(np, "config", i * 4 + 0, &index);
+		of_property_read_u32_index(np, "config", i * 4 + 1, &reg);
+		of_property_read_u32_index(np, "config", i * 4 + 2, &mask);
+		of_property_read_u32_index(np, "config", i * 4 + 3, &val);
+
+		ret = regmap_update_bits(map[index], reg, mask, val);
+		if (ret < 0) {
+			dev_err(dev, "%d Register 0x%x update failed: %d\n",
+				i, reg, ret);
+			return ret;
+		}
+	}
+	dev_info(dev, "Initialisation success for Node %s, sub-node %s\n",
+				dev_node->name, config_np_name);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(regmap_system_prod_config);
 
 /*
  * regmap_get_val_bytes(): Report the size of a register value

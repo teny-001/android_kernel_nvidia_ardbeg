@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011-2014, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2011-2015, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -26,6 +26,7 @@
 #define TEGRA_MODEM_AUTOSUSPEND	0x01
 #define TEGRA_MODEM_RECOVERY	0x02
 #define TEGRA_USB_HOST_RELOAD	0x04
+#define TEGRA_MODEM_CPU_BOOST	0x08
 
 /* modem operations */
 struct tegra_modem_operations {
@@ -47,11 +48,14 @@ struct tegra_usb_modem_power_platform_data {
 	int boot_gpio;			/* modem boot gpio */
 	unsigned long boot_irq_flags;	/* modem boot irq flags */
 	int autosuspend_delay;		/* autosuspend delay in milliseconds */
-	int short_autosuspend_delay;	/* short autosuspend delay in ms */
 	const struct platform_device *tegra_ehci_device; /* USB host device */
 	struct tegra_usb_platform_data *tegra_ehci_pdata;
+#if defined(CONFIG_ARCH_TEGRA_21x_SOC)
+	struct device_node *ehci_node;  /* EHCI device tree node */
+#endif
 	int mdm_power_report_gpio;	/* modem power increase report gpio */
 	unsigned long mdm_power_irq_flags; /* modem boot irq flags */
+	unsigned int num_temp_sensors; /* num of temps modem reports */
 };
 
 #endif /* __MACH_TEGRA_USB_MODEM_POWER_H */

@@ -19,7 +19,6 @@
 #ifndef GK20A_SCALE_H
 #define GK20A_SCALE_H
 
-#include <linux/nvhost.h>
 #include <linux/devfreq.h>
 
 struct platform_device;
@@ -36,8 +35,10 @@ struct gk20a_scale_profile {
 
 /* Initialization and de-initialization for module */
 void gk20a_scale_init(struct platform_device *);
+void gk20a_scale_exit(struct platform_device *);
 void gk20a_scale_hw_init(struct platform_device *pdev);
 
+#ifdef CONFIG_GK20A_DEVFREQ
 /*
  * call when performing submit to notify scaling mechanism that the module is
  * in use
@@ -47,5 +48,11 @@ void gk20a_scale_notify_idle(struct platform_device *);
 
 void gk20a_scale_suspend(struct platform_device *);
 void gk20a_scale_resume(struct platform_device *);
+#else
+static inline void gk20a_scale_notify_busy(struct platform_device *pdev) {}
+static inline void gk20a_scale_notify_idle(struct platform_device *pdev) {}
+static inline void gk20a_scale_suspend(struct platform_device *pdev) {}
+static inline void gk20a_scale_resume(struct platform_device *pdev) {}
+#endif
 
 #endif

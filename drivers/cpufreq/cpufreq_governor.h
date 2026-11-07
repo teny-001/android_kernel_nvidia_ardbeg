@@ -18,10 +18,9 @@
 #define _CPUFREQ_GOVERNOR_H
 
 #include <linux/cpufreq.h>
-#include <linux/kobject.h>
+#include <linux/kernel_stat.h>
+#include <linux/module.h>
 #include <linux/mutex.h>
-#include <linux/workqueue.h>
-#include <linux/sysfs.h>
 
 /*
  * The polling frequency depends on the capability of the processor. Default
@@ -169,7 +168,6 @@ struct od_dbs_tuners {
 	unsigned int sampling_rate;
 	unsigned int sampling_down_factor;
 	unsigned int up_threshold;
-	unsigned int adj_up_threshold;
 	unsigned int powersave_bias;
 	unsigned int io_is_busy;
 };

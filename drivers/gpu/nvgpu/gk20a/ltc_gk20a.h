@@ -13,9 +13,9 @@
  * more details.
  */
 
-#ifndef _NVHOST_GK20A_LTC
-#define _NVHOST_GK20A_LTC
-struct gk20a;
+#ifndef LTC_GK20A_H
+#define LTC_GK20A_H
+struct gpu_ops;
 
 void gk20a_init_ltc(struct gpu_ops *gops);
 #endif

@@ -765,12 +765,12 @@ class_dir_create_and_add(struct class *class, struct kobject *parent_kobj)
 	return &dir->kobj;
 }
 
+static DEFINE_MUTEX(gdp_mutex);
 
 static struct kobject *get_device_parent(struct device *dev,
 					 struct device *parent)
 {
 	if (dev->class) {
-		static DEFINE_MUTEX(gdp_mutex);
 		struct kobject *kobj = NULL;
 		struct kobject *parent_kobj;
 		struct kobject *k;
@@ -834,7 +834,9 @@ static void cleanup_glue_dir(struct device *dev, struct kobject *glue_dir)
 	    glue_dir->kset != &dev->class->p->glue_dirs)
 		return;
 
+	mutex_lock(&gdp_mutex);
 	kobject_put(glue_dir);
+	mutex_unlock(&gdp_mutex);
 }
 
 static void cleanup_device_parent(struct device *dev)
@@ -1841,6 +1843,7 @@ out:
 }
 EXPORT_SYMBOL_GPL(device_move);
 
+static LIST_HEAD(shutdown_list);
 /**
  * device_shutdown - call ->shutdown() on each device to shutdown.
  */
@@ -1889,6 +1892,51 @@ void device_shutdown(void)
 			if (initcall_debug)
 				dev_info(dev, "shutdown\n");
 			dev->driver->shutdown(dev);
+		}
+
+		device_unlock(dev);
+		if (parent)
+			device_unlock(parent);
+
+		if (dev->driver && dev->driver->late_shutdown) {
+			spin_lock(&devices_kset->list_lock);
+			list_add(&dev->kobj.entry, &shutdown_list);
+			spin_unlock(&devices_kset->list_lock);
+		}
+		put_device(dev);
+		put_device(parent);
+		spin_lock(&devices_kset->list_lock);
+	}
+
+	pr_info("late_shutdown started\n");
+
+	while (!list_empty(&shutdown_list)) {
+		dev = list_entry(shutdown_list.prev, struct device,
+				kobj.entry);
+
+		/*
+		 * hold reference count of device's parent to
+		 * prevent it from being freed because parent's
+		 * lock is to be held
+		 */
+		parent = get_device(dev->parent);
+		get_device(dev);
+		/*
+		 * Make sure the device is off the kset list, in the
+		 * event that dev->*->shutdown() doesn't remove it.
+		 */
+		list_del_init(&dev->kobj.entry);
+		spin_unlock(&devices_kset->list_lock);
+
+		/* hold lock to avoid race with probe/release */
+		if (parent)
+			device_lock(parent);
+		device_lock(dev);
+
+		if (dev->driver && dev->driver->late_shutdown) {
+			if (initcall_debug)
+				dev_info(dev, "late_shutdown\n");
+			dev->driver->late_shutdown(dev);
 		}
 
 		device_unlock(dev);

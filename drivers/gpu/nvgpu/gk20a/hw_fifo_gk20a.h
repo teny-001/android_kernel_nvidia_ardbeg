@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2014, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2012-2015, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -114,21 +114,37 @@ static inline u32 fifo_eng_runlist_pending_true_f(void)
 {
 	return 0x100000;
 }
-static inline u32 fifo_eng_timeslice_r(u32 i)
+static inline u32 fifo_runlist_timeslice_r(u32 i)
 {
 	return 0x00002310 + i*4;
 }
-static inline u32 fifo_eng_timeslice_timeout_128_f(void)
+static inline u32 fifo_runlist_timeslice_timeout_128_f(void)
 {
 	return 0x80;
 }
-static inline u32 fifo_eng_timeslice_timescale_3_f(void)
+static inline u32 fifo_runlist_timeslice_timescale_3_f(void)
 {
 	return 0x3000;
 }
-static inline u32 fifo_eng_timeslice_enable_true_f(void)
+static inline u32 fifo_runlist_timeslice_enable_true_f(void)
 {
 	return 0x10000000;
+}
+static inline u32 fifo_eng_timeout_r(void)
+{
+	return 0x00002a0c;
+}
+static inline u32 fifo_eng_timeout_period_max_f(void)
+{
+	return 0x7fffffff;
+}
+static inline u32 fifo_eng_timeout_detection_enabled_f(void)
+{
+	return 0x80000000;
+}
+static inline u32 fifo_eng_timeout_detection_disabled_f(void)
+{
+	return 0x0;
 }
 static inline u32 fifo_pb_timeslice_r(u32 i)
 {
@@ -230,9 +246,21 @@ static inline u32 fifo_intr_en_0_r(void)
 {
 	return 0x00002140;
 }
+static inline u32 fifo_intr_en_0_sched_error_f(u32 v)
+{
+	return (v & 0x1) << 8;
+}
 static inline u32 fifo_intr_en_0_sched_error_m(void)
 {
 	return 0x1 << 8;
+}
+static inline u32 fifo_intr_en_0_mmu_fault_f(u32 v)
+{
+	return (v & 0x1) << 28;
+}
+static inline u32 fifo_intr_en_0_mmu_fault_m(void)
+{
+	return 0x1 << 28;
 }
 static inline u32 fifo_intr_en_1_r(void)
 {
@@ -350,30 +378,6 @@ static inline u32 fifo_pb_timeout_detection_enabled_f(void)
 {
 	return 0x80000000;
 }
-static inline u32 fifo_eng_timeout_r(void)
-{
-	return 0x00002a0c;
-}
-static inline u32 fifo_eng_timeout_period_m(void)
-{
-	return 0x7fffffff << 0;
-}
-static inline u32 fifo_eng_timeout_period_max_f(void)
-{
-	return 0x7fffffff;
-}
-static inline u32 fifo_eng_timeout_detection_m(void)
-{
-	return 0x1 << 31;
-}
-static inline u32 fifo_eng_timeout_detection_enabled_f(void)
-{
-	return 0x80000000;
-}
-static inline u32 fifo_eng_timeout_detection_disabled_f(void)
-{
-	return 0x0;
-}
 static inline u32 fifo_error_sched_disable_r(void)
 {
 	return 0x0000262c;
@@ -406,7 +410,15 @@ static inline u32 fifo_preempt_type_channel_f(void)
 {
 	return 0x0;
 }
+static inline u32 fifo_preempt_type_tsg_f(void)
+{
+	return 0x1000000;
+}
 static inline u32 fifo_preempt_chid_f(u32 v)
+{
+	return (v & 0xfff) << 0;
+}
+static inline u32 fifo_preempt_id_f(u32 v)
 {
 	return (v & 0xfff) << 0;
 }
@@ -441,6 +453,10 @@ static inline u32 fifo_engine_status_id_type_v(u32 r)
 static inline u32 fifo_engine_status_id_type_chid_v(void)
 {
 	return 0x00000000;
+}
+static inline u32 fifo_engine_status_id_type_tsgid_v(void)
+{
+	return 0x00000001;
 }
 static inline u32 fifo_engine_status_ctx_status_v(u32 r)
 {
@@ -525,6 +541,10 @@ static inline u32 fifo_pbdma_status_id_type_v(u32 r)
 static inline u32 fifo_pbdma_status_id_type_chid_v(void)
 {
 	return 0x00000000;
+}
+static inline u32 fifo_pbdma_status_id_type_tsgid_v(void)
+{
+	return 0x00000001;
 }
 static inline u32 fifo_pbdma_status_chan_status_v(u32 r)
 {

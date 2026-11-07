@@ -19,8 +19,6 @@ typedef elf_greg_t elf_gregset_t[ELF_NGREG];
 
 typedef struct user_fp elf_fpregset_t;
 
-#define EM_ARM	40
-
 #define EF_ARM_EABI_MASK	0xff000000
 #define EF_ARM_EABI_UNKNOWN	0x00000000
 #define EF_ARM_EABI_VER1	0x01000000
@@ -117,7 +115,7 @@ int dump_task_regs(struct task_struct *t, elf_gregset_t *elfregs);
    the loader.  We need to make sure that it is out of the way of the program
    that it will "exec", and that there is sufficient room for the brk.  */
 
-#define ELF_ET_DYN_BASE	(2 * TASK_SIZE / 3)
+#define ELF_ET_DYN_BASE	(TASK_SIZE / 3 * 2)
 
 /* When the program starts, a1 contains a pointer to a function to be 
    registered with atexit, as per the SVR4 ABI.  A value of 0 means we 
@@ -126,6 +124,12 @@ int dump_task_regs(struct task_struct *t, elf_gregset_t *elfregs);
 
 extern void elf_set_personality(const struct elf32_hdr *);
 #define SET_PERSONALITY(ex)	elf_set_personality(&(ex))
+
+#define ARCH_DLINFO							\
+do {									\
+	NEW_AUX_ENT(AT_SYSINFO_EHDR,					\
+		    (elf_addr_t)current->mm->context.vdso);		\
+} while (0)
 
 struct mm_struct;
 extern unsigned long arch_randomize_brk(struct mm_struct *mm);

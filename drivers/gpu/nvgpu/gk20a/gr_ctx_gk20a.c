@@ -3,7 +3,7 @@
  *
  * GK20A Graphics Context
  *
- * Copyright (c) 2011-2014, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2011-2015, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -20,9 +20,6 @@
  */
 
 #include <linux/firmware.h>
-
-#include "dev.h"
-#include "bus_client.h"
 
 #include "gk20a.h"
 #include "gr_ctx_gk20a.h"
@@ -99,6 +96,15 @@ static int gr_gk20a_get_netlist_name(int index, char *name)
 	return -1;
 }
 
+static bool gr_gk20a_is_firmware_defined(void)
+{
+#ifdef GK20A_NETLIST_IMAGE_FW_NAME
+	return true;
+#else
+	return false;
+#endif
+}
+
 static int gr_gk20a_init_ctx_vars_fw(struct gk20a *g, struct gr_gk20a *gr)
 {
 	struct device *d = dev_from_gk20a(g);
@@ -110,21 +116,21 @@ static int gr_gk20a_init_ctx_vars_fw(struct gk20a *g, struct gr_gk20a *gr)
 
 	gk20a_dbg_fn("");
 
-#ifdef GK20A_NETLIST_IMAGE_FW_NAME
-	net = NETLIST_FINAL;
-	max = 0;
-	major_v_hw = ~0;
-	g->gr.ctx_vars.dynamic = false;
-#else
-	net = NETLIST_SLOT_A;
-	max = MAX_NETLIST;
-	major_v_hw = gk20a_readl(g, gr_fecs_ctx_state_store_major_rev_id_r());
-	g->gr.ctx_vars.dynamic = true;
-#endif
+	if (g->ops.gr_ctx.is_fw_defined()) {
+		net = NETLIST_FINAL;
+		max = 0;
+		major_v_hw = ~0;
+		g->gr.ctx_vars.dynamic = false;
+	} else {
+		net = NETLIST_SLOT_A;
+		max = MAX_NETLIST;
+		major_v_hw = gk20a_readl(g,
+				gr_fecs_ctx_state_store_major_rev_id_r());
+		g->gr.ctx_vars.dynamic = true;
+	}
 
 	for (; net < max; net++) {
-
-		if (gr_gk20a_get_netlist_name(net, name) != 0) {
+		if (g->ops.gr_ctx.get_netlist_name(net, name) != 0) {
 			gk20a_warn(d, "invalid netlist index %d", net);
 			continue;
 		}
@@ -278,7 +284,7 @@ static int gr_gk20a_init_ctx_vars_fw(struct gk20a *g, struct gr_gk20a *gr)
 				gk20a_dbg_info("NETLIST_REGIONID_CTXREG_PMPPC skipped");
 				break;
 			default:
-				gk20a_warn(d, "unrecognized region %d skipped", i);
+				gk20a_dbg_info("unrecognized region %d skipped", i);
 				break;
 			}
 		}
@@ -333,4 +339,11 @@ int gr_gk20a_init_ctx_vars(struct gk20a *g, struct gr_gk20a *gr)
 		return gr_gk20a_init_ctx_vars_sim(g, gr);
 	else
 		return gr_gk20a_init_ctx_vars_fw(g, gr);
+}
+
+void gk20a_init_gr_ctx(struct gpu_ops *gops)
+{
+	gops->gr_ctx.get_netlist_name = gr_gk20a_get_netlist_name;
+	gops->gr_ctx.is_fw_defined = gr_gk20a_is_firmware_defined;
+	gops->gr_ctx.use_dma_for_fw_bootstrap = true;
 }

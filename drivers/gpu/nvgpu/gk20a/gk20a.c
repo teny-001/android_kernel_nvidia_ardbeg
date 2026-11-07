@@ -1,9 +1,7 @@
 /*
- * drivers/video/tegra/host/gk20a/gk20a.c
- *
  * GK20A Graphics
  *
- * Copyright (c) 2011-2014, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2011-2015, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -21,6 +19,7 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/gk20a.h>
 
+#include <linux/module.h>
 #include <linux/dma-mapping.h>
 #include <linux/highmem.h>
 #include <linux/string.h>
@@ -40,16 +39,15 @@
 #include <linux/debugfs.h>
 #include <linux/spinlock.h>
 #include <linux/tegra-powergate.h>
+#include <linux/tegra_pm_domains.h>
+#include <linux/clk/tegra.h>
+#include <linux/kthread.h>
 
 #include <linux/sched.h>
-#include <linux/input-cfboost.h>
 
-#include <mach/pm_domains.h>
-
-#include "dev.h"
-#include "class_ids.h"
-#include "bus_client.h"
-#include "nvhost_acm.h"
+#ifdef CONFIG_TEGRA_GK20A
+#include <linux/nvhost.h>
+#endif
 
 #include "gk20a.h"
 #include "debug_gk20a.h"
@@ -60,9 +58,17 @@
 #include "hw_sim_gk20a.h"
 #include "hw_top_gk20a.h"
 #include "hw_ltc_gk20a.h"
+#include "hw_gr_gk20a.h"
+#include "hw_fb_gk20a.h"
 #include "gk20a_scale.h"
 #include "dbg_gpu_gk20a.h"
+#include "gk20a_allocator.h"
 #include "hal.h"
+#include "vgpu/vgpu.h"
+
+#ifdef CONFIG_ARCH_TEGRA_18x_SOC
+#include "nvgpu_gpuid_t18x.h"
+#endif
 
 #ifdef CONFIG_ARM64
 #define __cpuc_flush_dcache_area __flush_dcache_area
@@ -72,12 +78,16 @@
 /* TODO: Change to e.g. "nvidia-gpu%s" once we have symlinks in place. */
 #define INTERFACE_NAME "nvhost%s-gpu"
 
-#define GK20A_NUM_CDEVS 5
+#define GK20A_NUM_CDEVS 6
+
+#define EMC3D_DEFAULT_RATIO 750
 
 #if defined(GK20A_DEBUG)
 u32 gk20a_dbg_mask = GK20A_DEFAULT_DBG_MASK;
 u32 gk20a_dbg_ftrace;
 #endif
+
+#define GK20A_WAIT_FOR_IDLE_MS	2000
 
 static int gk20a_pm_finalize_poweron(struct device *dev);
 static int gk20a_pm_prepare_poweroff(struct device *dev);
@@ -95,6 +105,7 @@ static const struct file_operations gk20a_channel_ops = {
 	.compat_ioctl = gk20a_channel_ioctl,
 #endif
 	.unlocked_ioctl = gk20a_channel_ioctl,
+	.poll = gk20a_channel_poll,
 };
 
 static const struct file_operations gk20a_ctrl_ops = {
@@ -141,10 +152,19 @@ static const struct file_operations gk20a_prof_ops = {
 	.unlocked_ioctl = gk20a_dbg_gpu_dev_ioctl,
 	/* .mmap           = gk20a_prof_gpu_dev_mmap,*/
 	/*int (*mmap) (struct file *, struct vm_area_struct *);*/
-	.compat_ioctl = gk20a_dbg_gpu_dev_ioctl,
 #ifdef CONFIG_COMPAT
 	.compat_ioctl = gk20a_dbg_gpu_dev_ioctl,
 #endif
+};
+
+static const struct file_operations gk20a_tsg_ops = {
+	.owner = THIS_MODULE,
+	.release = gk20a_tsg_dev_release,
+	.open = gk20a_tsg_dev_open,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl = gk20a_tsg_dev_ioctl,
+#endif
+	.unlocked_ioctl = gk20a_tsg_dev_ioctl,
 };
 
 static inline void sim_writel(struct gk20a *g, u32 r, u32 v)
@@ -157,15 +177,41 @@ static inline u32 sim_readl(struct gk20a *g, u32 r)
 	return readl(g->sim.regs+r);
 }
 
+/*
+ * Locks out the driver from accessing GPU registers. This prevents access to
+ * thse registers after the GPU has been clock or power gated. This should help
+ * find annoying bugs where register reads and writes are silently dropped
+ * after the GPU has been turned off. On older chips these reads and writes can
+ * also lock the entire CPU up.
+ */
+int gk20a_lockout_registers(struct gk20a *g)
+{
+	g->regs = NULL;
+	g->bar1 = NULL;
+
+	return 0;
+}
+
+/*
+ * Undoes gk20a_lockout_registers().
+ */
+int gk20a_restore_registers(struct gk20a *g)
+{
+	g->regs = g->regs_saved;
+	g->bar1 = g->bar1_saved;
+
+	return 0;
+}
+
 static void kunmap_and_free_iopage(void **kvaddr, struct page **page)
 {
 	if (*kvaddr) {
 		kunmap(*kvaddr);
-		*kvaddr = 0;
+		*kvaddr = NULL;
 	}
 	if (*page) {
 		__free_page(*page);
-		*page = 0;
+		*page = NULL;
 	}
 }
 
@@ -192,7 +238,7 @@ static void gk20a_remove_sim_support(struct sim_gk20a *s)
 
 static int alloc_and_kmap_iopage(struct device *d,
 				 void **kvaddr,
-				 phys_addr_t *phys,
+				 u64 *phys,
 				 struct page **page)
 {
 	int err = 0;
@@ -236,7 +282,7 @@ static int gk20a_init_sim_support(struct platform_device *dev)
 	int err = 0;
 	struct gk20a *g = get_gk20a(dev);
 	struct device *d = &dev->dev;
-	phys_addr_t phys;
+	u64 phys;
 
 	g->sim.g = g;
 	g->sim.regs = gk20a_ioremap_resource(dev, GK20A_SIM_IORESOURCE_MEM,
@@ -274,9 +320,9 @@ static int gk20a_init_sim_support(struct platform_device *dev)
 	sim_writel(g, sim_send_put_r(), g->sim.send_ring_put);
 
 	/*write send ring address and make it valid*/
-	/*TBD: work for >32b physmem*/
 	phys = g->sim.send_bfr.phys;
-	sim_writel(g, sim_send_ring_hi_r(), 0);
+	sim_writel(g, sim_send_ring_hi_r(),
+		   sim_send_ring_hi_addr_f(u64_hi32(phys)));
 	sim_writel(g, sim_send_ring_r(),
 		   sim_send_ring_status_valid_f() |
 		   sim_send_ring_target_phys_pci_coherent_f() |
@@ -291,9 +337,9 @@ static int gk20a_init_sim_support(struct platform_device *dev)
 	sim_writel(g, sim_recv_get_r(), g->sim.recv_ring_get);
 
 	/*write send ring address and make it valid*/
-	/*TBD: work for >32b physmem*/
 	phys = g->sim.recv_bfr.phys;
-	sim_writel(g, sim_recv_ring_hi_r(), 0);
+	sim_writel(g, sim_recv_ring_hi_r(),
+		   sim_recv_ring_hi_addr_f(u64_hi32(phys)));
 	sim_writel(g, sim_recv_ring_r(),
 		   sim_recv_ring_status_valid_f() |
 		   sim_recv_ring_target_phys_pci_coherent_f() |
@@ -362,7 +408,8 @@ static int rpc_send_message(struct gk20a *g)
 		sim_dma_size_4kb_f() |
 		sim_dma_addr_lo_f(g->sim.msg_bfr.phys >> PAGE_SHIFT);
 
-	*sim_send_ring_bfr(g, dma_hi_offset*sizeof(u32)) = 0; /*TBD >32b phys*/
+	*sim_send_ring_bfr(g, dma_hi_offset*sizeof(u32)) =
+		u64_hi32(g->sim.msg_bfr.phys);
 
 	*sim_msg_hdr(g, sim_msg_sequence_r()) = g->sim.sequence_base++;
 
@@ -386,7 +433,7 @@ static inline u32 *sim_recv_ring_bfr(struct gk20a *g, u32 byte_offset)
 
 static int rpc_recv_poll(struct gk20a *g)
 {
-	phys_addr_t recv_phys_addr;
+	u64 recv_phys_addr;
 
 	/* XXX This read is not required (?) */
 	/*pVGpu->recv_ring_get = VGPU_REG_RD32(pGpu, NV_VGPU_RECV_GET);*/
@@ -401,14 +448,14 @@ static int rpc_recv_poll(struct gk20a *g)
 		/* these are in u32 offsets*/
 		u32 dma_lo_offset =
 			sim_recv_put_pointer_v(g->sim.recv_ring_get)*2 + 0;
-		/*u32 dma_hi_offset = dma_lo_offset + 1;*/
-		u32 recv_phys_addr_lo =	sim_dma_addr_lo_v(*sim_recv_ring_bfr(g, dma_lo_offset*4));
+		u32 dma_hi_offset = dma_lo_offset + 1;
+		u32 recv_phys_addr_lo = sim_dma_addr_lo_v(
+				*sim_recv_ring_bfr(g, dma_lo_offset*4));
+		u32 recv_phys_addr_hi = sim_dma_hi_addr_v(
+				*sim_recv_ring_bfr(g, dma_hi_offset*4));
 
-		/*u32 recv_phys_addr_hi = sim_dma_hi_addr_v(
-		      (phys_addr_t)sim_recv_ring_bfr(g,dma_hi_offset*4));*/
-
-		/*TBD >32b phys addr */
-		recv_phys_addr = recv_phys_addr_lo << PAGE_SHIFT;
+		recv_phys_addr = (u64)recv_phys_addr_hi << 32 |
+				 (u64)recv_phys_addr_lo << PAGE_SHIFT;
 
 		if (recv_phys_addr != g->sim.msg_bfr.phys) {
 			dev_err(dev_from_gk20a(g), "%s Error in RPC reply\n",
@@ -483,67 +530,42 @@ int gk20a_sim_esc_read(struct gk20a *g, char *path, u32 index, u32 count, u32 *d
 static irqreturn_t gk20a_intr_isr_stall(int irq, void *dev_id)
 {
 	struct gk20a *g = dev_id;
-	u32 mc_intr_0;
 
-	if (!g->power_on)
-		return IRQ_NONE;
-
-	/* not from gpu when sharing irq with others */
-	mc_intr_0 = gk20a_readl(g, mc_intr_0_r());
-	if (unlikely(!mc_intr_0))
-		return IRQ_NONE;
-
-	gk20a_writel(g, mc_intr_en_0_r(),
-		mc_intr_en_0_inta_disabled_f());
-
-	/* flush previous write */
-	gk20a_readl(g, mc_intr_en_0_r());
-
-	return IRQ_WAKE_THREAD;
+	return g->ops.mc.isr_stall(g);
 }
 
 static irqreturn_t gk20a_intr_isr_nonstall(int irq, void *dev_id)
 {
 	struct gk20a *g = dev_id;
-	u32 mc_intr_1;
 
-	if (!g->power_on)
-		return IRQ_NONE;
-
-	/* not from gpu when sharing irq with others */
-	mc_intr_1 = gk20a_readl(g, mc_intr_1_r());
-	if (unlikely(!mc_intr_1))
-		return IRQ_NONE;
-
-	gk20a_writel(g, mc_intr_en_1_r(),
-		mc_intr_en_1_inta_disabled_f());
-
-	/* flush previous write */
-	gk20a_readl(g, mc_intr_en_1_r());
-
-	return IRQ_WAKE_THREAD;
+	return g->ops.mc.isr_nonstall(g);
 }
 
-static void gk20a_pbus_isr(struct gk20a *g)
+void gk20a_pbus_isr(struct gk20a *g)
 {
-	u32 val;
+	u32 val, err_code;
 	val = gk20a_readl(g, bus_intr_0_r());
 	if (val & (bus_intr_0_pri_squash_m() |
 			bus_intr_0_pri_fecserr_m() |
 			bus_intr_0_pri_timeout_m())) {
-		gk20a_err(dev_from_gk20a(g), "top_fs_status_r : 0x%x",
-			gk20a_readl(g, top_fs_status_r()));
 		gk20a_err(dev_from_gk20a(g), "pmc_enable : 0x%x",
 			gk20a_readl(g, mc_enable_r()));
+		gk20a_err(dev_from_gk20a(g), "NV_PBUS_INTR_0 : 0x%x", val);
 		gk20a_err(&g->dev->dev,
 			"NV_PTIMER_PRI_TIMEOUT_SAVE_0: 0x%x\n",
 			gk20a_readl(g, timer_pri_timeout_save_0_r()));
 		gk20a_err(&g->dev->dev,
 			"NV_PTIMER_PRI_TIMEOUT_SAVE_1: 0x%x\n",
 			gk20a_readl(g, timer_pri_timeout_save_1_r()));
+		err_code = gk20a_readl(g, timer_pri_timeout_fecs_errcode_r());
 		gk20a_err(&g->dev->dev,
 			"NV_PTIMER_PRI_TIMEOUT_FECS_ERRCODE: 0x%x\n",
-			gk20a_readl(g, timer_pri_timeout_fecs_errcode_r()));
+			err_code);
+		if (err_code == 0xbadf13)
+			gk20a_err(&g->dev->dev,
+			"NV_PGRAPH_PRI_GPC0_GPCCS_FS_GPC: 0x%x\n",
+			gk20a_readl(g, gr_gpc0_fs_gpc_r()));
+
 	}
 
 	if (val)
@@ -556,59 +578,13 @@ static void gk20a_pbus_isr(struct gk20a *g)
 static irqreturn_t gk20a_intr_thread_stall(int irq, void *dev_id)
 {
 	struct gk20a *g = dev_id;
-	u32 mc_intr_0;
-
-	gk20a_dbg(gpu_dbg_intr, "interrupt thread launched");
-
-	mc_intr_0 = gk20a_readl(g, mc_intr_0_r());
-
-	gk20a_dbg(gpu_dbg_intr, "stall intr %08x\n", mc_intr_0);
-
-	if (mc_intr_0 & mc_intr_0_pgraph_pending_f())
-		gr_gk20a_elpg_protected_call(g, gk20a_gr_isr(g));
-	if (mc_intr_0 & mc_intr_0_pfifo_pending_f())
-		gk20a_fifo_isr(g);
-	if (mc_intr_0 & mc_intr_0_pmu_pending_f())
-		gk20a_pmu_isr(g);
-	if (mc_intr_0 & mc_intr_0_priv_ring_pending_f())
-		gk20a_priv_ring_isr(g);
-	if (mc_intr_0 & mc_intr_0_ltc_pending_f())
-		gk20a_mm_ltc_isr(g);
-	if (mc_intr_0 & mc_intr_0_pbus_pending_f())
-		gk20a_pbus_isr(g);
-
-	gk20a_writel(g, mc_intr_en_0_r(),
-		mc_intr_en_0_inta_hardware_f());
-
-	/* flush previous write */
-	gk20a_readl(g, mc_intr_en_0_r());
-
-	return IRQ_HANDLED;
+	return g->ops.mc.isr_thread_stall(g);
 }
 
 static irqreturn_t gk20a_intr_thread_nonstall(int irq, void *dev_id)
 {
 	struct gk20a *g = dev_id;
-	u32 mc_intr_1;
-
-	gk20a_dbg(gpu_dbg_intr, "interrupt thread launched");
-
-	mc_intr_1 = gk20a_readl(g, mc_intr_1_r());
-
-	gk20a_dbg(gpu_dbg_intr, "non-stall intr %08x\n", mc_intr_1);
-
-	if (mc_intr_1 & mc_intr_0_pfifo_pending_f())
-		gk20a_fifo_nonstall_isr(g);
-	if (mc_intr_1 & mc_intr_0_pgraph_pending_f())
-		gk20a_gr_nonstall_isr(g);
-
-	gk20a_writel(g, mc_intr_en_1_r(),
-		mc_intr_en_1_inta_hardware_f());
-
-	/* flush previous write */
-	gk20a_readl(g, mc_intr_en_1_r());
-
-	return IRQ_HANDLED;
+	return g->ops.mc.isr_thread_nonstall(g);
 }
 
 static void gk20a_remove_support(struct platform_device *dev)
@@ -617,9 +593,6 @@ static void gk20a_remove_support(struct platform_device *dev)
 
 	if (g->pmu.remove_support)
 		g->pmu.remove_support(&g->pmu);
-
-	if (g->gk20a_cdev.gk20a_cooling_dev)
-		thermal_cooling_device_unregister(g->gk20a_cdev.gk20a_cooling_dev);
 
 	if (g->gr.remove_support)
 		g->gr.remove_support(&g->gr);
@@ -635,21 +608,15 @@ static void gk20a_remove_support(struct platform_device *dev)
 
 	release_firmware(g->pmu_fw);
 
-	if (g->irq_requested) {
-		free_irq(g->irq_stall, g);
-		free_irq(g->irq_nonstall, g);
-		g->irq_requested = false;
-	}
-
-	/* free mappings to registers, etc*/
+	/* free mappings to registers, etc */
 
 	if (g->regs) {
 		iounmap(g->regs);
-		g->regs = 0;
+		g->regs = NULL;
 	}
 	if (g->bar1) {
 		iounmap(g->bar1);
-		g->bar1 = 0;
+		g->bar1 = NULL;
 	}
 }
 
@@ -674,8 +641,10 @@ static int gk20a_init_support(struct platform_device *dev)
 		goto fail;
 	}
 
+	g->regs_saved = g->regs;
+	g->bar1_saved = g->bar1;
+
 	/* Get interrupt numbers */
-	g->irq_stall = platform_get_irq(dev, 0);
 	g->irq_nonstall = platform_get_irq(dev, 1);
 	if (g->irq_stall < 0 || g->irq_nonstall < 0) {
 		err = -ENXIO;
@@ -690,6 +659,7 @@ static int gk20a_init_support(struct platform_device *dev)
 
 	mutex_init(&g->dbg_sessions_lock);
 	mutex_init(&g->client_lock);
+	mutex_init(&g->poweroff_lock);
 
 	g->remove_support = gk20a_remove_support;
 	return 0;
@@ -697,57 +667,6 @@ static int gk20a_init_support(struct platform_device *dev)
  fail:
 	gk20a_remove_support(dev);
 	return err;
-}
-
-static int gk20a_init_client(struct platform_device *dev)
-{
-	struct gk20a *g = get_gk20a(dev);
-	int err;
-
-	gk20a_dbg_fn("");
-
-#ifndef CONFIG_PM_RUNTIME
-	gk20a_pm_finalize_poweron(&dev->dev);
-#endif
-
-	err = gk20a_init_mm_setup_sw(g);
-	if (err)
-		return err;
-
-	if (IS_ENABLED(CONFIG_GK20A_DEVFREQ))
-		gk20a_scale_hw_init(dev);
-	return 0;
-}
-
-static void gk20a_deinit_client(struct platform_device *dev)
-{
-	gk20a_dbg_fn("");
-#ifndef CONFIG_PM_RUNTIME
-	gk20a_pm_prepare_poweroff(&dev->dev);
-#endif
-}
-
-int gk20a_get_client(struct gk20a *g)
-{
-	int err = 0;
-
-	mutex_lock(&g->client_lock);
-	if (g->client_refcount == 0)
-		err = gk20a_init_client(g->dev);
-	if (!err)
-		g->client_refcount++;
-	mutex_unlock(&g->client_lock);
-	return err;
-}
-
-void gk20a_put_client(struct gk20a *g)
-{
-	mutex_lock(&g->client_lock);
-	if (g->client_refcount == 1)
-		gk20a_deinit_client(g->dev);
-	g->client_refcount--;
-	mutex_unlock(&g->client_lock);
-	WARN_ON(g->client_refcount < 0);
 }
 
 static int gk20a_pm_prepare_poweroff(struct device *dev)
@@ -758,46 +677,59 @@ static int gk20a_pm_prepare_poweroff(struct device *dev)
 
 	gk20a_dbg_fn("");
 
-	gk20a_scale_suspend(pdev);
+	mutex_lock(&g->poweroff_lock);
 
 	if (!g->power_on)
-		return 0;
+		goto done;
+
+	gk20a_scale_suspend(pdev);
 
 	ret = gk20a_channel_suspend(g);
 	if (ret)
-		return ret;
+		goto done;
 
+	/* cancel any pending cde work */
+	gk20a_cde_suspend(g);
+
+	/* disable elpg before gr or fifo suspend */
+	ret |= gk20a_pmu_destroy(g);
 	/*
 	 * After this point, gk20a interrupts should not get
 	 * serviced.
 	 */
-	if (g->irq_requested) {
-		free_irq(g->irq_stall, g);
-		free_irq(g->irq_nonstall, g);
-		g->irq_requested = false;
-	}
+	disable_irq(g->irq_stall);
+	disable_irq(g->irq_nonstall);
 
-	/* disable elpg before gr or fifo suspend */
-	ret |= gk20a_pmu_destroy(g);
 	ret |= gk20a_gr_suspend(g);
 	ret |= gk20a_mm_suspend(g);
 	ret |= gk20a_fifo_suspend(g);
 
 	/* Disable GPCPLL */
-	ret |= gk20a_suspend_clk_support(g);
+	if (g->ops.clk.suspend_clk_support)
+		ret |= g->ops.clk.suspend_clk_support(g);
 
 	g->power_on = false;
+
+	/* Stop CPU from accessing the GPU registers. */
+	gk20a_lockout_registers(g);
+
+done:
+	mutex_unlock(&g->poweroff_lock);
 
 	return ret;
 }
 
-static void gk20a_detect_chip(struct gk20a *g)
+static int gk20a_detect_chip(struct gk20a *g)
 {
-	struct nvhost_gpu_characteristics *gpu = &g->gpu_characteristics;
+	struct nvgpu_gpu_characteristics *gpu = &g->gpu_characteristics;
+	u32 mc_boot_0_value;
 
-	u32 mc_boot_0_value = gk20a_readl(g, mc_boot_0_r());
+	if (gpu->arch)
+		return 0;
+
+	mc_boot_0_value = gk20a_readl(g, mc_boot_0_r());
 	gpu->arch = mc_boot_0_architecture_v(mc_boot_0_value) <<
-		NVHOST_GPU_ARCHITECTURE_SHIFT;
+		NVGPU_GPU_ARCHITECTURE_SHIFT;
 	gpu->impl = mc_boot_0_implementation_v(mc_boot_0_value);
 	gpu->rev =
 		(mc_boot_0_major_revision_v(mc_boot_0_value) << 4) |
@@ -807,12 +739,30 @@ static void gk20a_detect_chip(struct gk20a *g)
 			g->gpu_characteristics.arch,
 			g->gpu_characteristics.impl,
 			g->gpu_characteristics.rev);
+
+	return gpu_init_hal(g);
+}
+
+static void gk20a_pm_restore_debug_setting(struct gk20a *g)
+{
+	u32 mmu_debug_ctrl;
+
+	/* restore mmu debug state */
+	if (g->mmu_debug_ctrl)
+		mmu_debug_ctrl = fb_mmu_debug_ctrl_debug_enabled_v();
+	else
+		mmu_debug_ctrl = fb_mmu_debug_ctrl_debug_disabled_v();
+
+	mmu_debug_ctrl = gk20a_readl(g, fb_mmu_debug_ctrl_r());
+	mmu_debug_ctrl = set_field(mmu_debug_ctrl, fb_mmu_debug_ctrl_debug_m(), mmu_debug_ctrl);
+	gk20a_writel(g, fb_mmu_debug_ctrl_r(), mmu_debug_ctrl);
 }
 
 static int gk20a_pm_finalize_poweron(struct device *dev)
 {
 	struct platform_device *pdev = to_platform_device(dev);
 	struct gk20a *g = get_gk20a(pdev);
+	struct gk20a_platform *platform = gk20a_get_platform(pdev);
 	int err, nice_value;
 
 	gk20a_dbg_fn("");
@@ -820,49 +770,20 @@ static int gk20a_pm_finalize_poweron(struct device *dev)
 	if (g->power_on)
 		return 0;
 
+	trace_gk20a_finalize_poweron(dev_name(dev));
+
+	err = gk20a_restore_registers(g);
+	if (err)
+		return err;
+
 	nice_value = task_nice(current);
 	set_user_nice(current, -20);
 
-	if (!g->irq_requested) {
-		err = request_threaded_irq(g->irq_stall,
-				gk20a_intr_isr_stall,
-				gk20a_intr_thread_stall,
-				0, "gk20a_stall", g);
-		if (err) {
-			dev_err(dev_from_gk20a(g),
-				"failed to request stall intr irq @ %lld\n",
-					(u64)g->irq_stall);
-			goto done;
-		}
-		err = request_threaded_irq(g->irq_nonstall,
-				gk20a_intr_isr_nonstall,
-				gk20a_intr_thread_nonstall,
-				0, "gk20a_nonstall", g);
-		if (err) {
-			dev_err(dev_from_gk20a(g),
-				"failed to request non-stall intr irq @ %lld\n",
-					(u64)g->irq_nonstall);
-			goto done;
-		}
-		g->irq_requested = true;
-	}
-
 	g->power_on = true;
 
-	gk20a_writel(g, mc_intr_mask_1_r(),
-			mc_intr_0_pfifo_pending_f()
-			| mc_intr_0_pgraph_pending_f());
-	gk20a_writel(g, mc_intr_en_1_r(),
-		mc_intr_en_1_inta_hardware_f());
-
-	gk20a_writel(g, mc_intr_mask_0_r(),
-			mc_intr_0_pgraph_pending_f()
-			| mc_intr_0_pfifo_pending_f()
-			| mc_intr_0_priv_ring_pending_f()
-			| mc_intr_0_ltc_pending_f()
-			| mc_intr_0_pbus_pending_f());
-	gk20a_writel(g, mc_intr_en_0_r(),
-		mc_intr_en_0_inta_hardware_f());
+	err = gk20a_detect_chip(g);
+	if (err)
+		goto done;
 
 	if (!tegra_platform_is_silicon())
 		gk20a_writel(g, bus_intr_en_0_r(), 0x0);
@@ -871,12 +792,11 @@ static int gk20a_pm_finalize_poweron(struct device *dev)
 			        bus_intr_en_0_pri_squash_m() |
 			        bus_intr_en_0_pri_fecserr_m() |
 			        bus_intr_en_0_pri_timeout_m());
-	gk20a_reset_priv_ring(g);
 
-	gk20a_detect_chip(g);
-	err = gpu_init_hal(g);
-	if (err)
-		goto done;
+	if (g->ops.clk.disable_slowboot)
+		g->ops.clk.disable_slowboot(g);
+
+	gk20a_reset_priv_ring(g);
 
 	/* TBD: move this after graphics init in which blcg/slcg is enabled.
 	   This function removes SlowdownOnBoot which applies 32x divider
@@ -884,10 +804,12 @@ static int gk20a_pm_finalize_poweron(struct device *dev)
 	   during boot but it also significantly slows down gk20a init on
 	   simulation and emulation. We should remove SOB after graphics power
 	   saving features (blcg/slcg) are enabled. For now, do it here. */
-	err = gk20a_init_clk_support(g);
-	if (err) {
-		gk20a_err(dev, "failed to init gk20a clk");
-		goto done;
+	if (g->ops.clk.init_clk_support) {
+		err = g->ops.clk.init_clk_support(g);
+		if (err) {
+			gk20a_err(dev, "failed to init gk20a clk");
+			goto done;
+		}
 	}
 
 	/* enable pri timeout only on silicon */
@@ -909,21 +831,41 @@ static int gk20a_pm_finalize_poweron(struct device *dev)
 		goto done;
 	}
 
+	g->ops.fb.reset(g);
+
+	if (g->ops.ltc.init_fs_state)
+		g->ops.ltc.init_fs_state(g);
+
 	err = gk20a_init_mm_support(g);
 	if (err) {
 		gk20a_err(dev, "failed to init gk20a mm");
 		goto done;
 	}
 
-	err = gk20a_init_pmu_support(g);
-	if (err) {
-		gk20a_err(dev, "failed to init gk20a pmu");
-		goto done;
-	}
-
 	err = gk20a_init_fifo_support(g);
 	if (err) {
 		gk20a_err(dev, "failed to init gk20a fifo");
+		goto done;
+	}
+
+	g->ops.mc.intr_enable(g);
+
+	err = gk20a_enable_gr_hw(g);
+	if (err) {
+		gk20a_err(dev, "failed to enable gr");
+		goto done;
+	}
+
+	if (g->ops.pmu.prepare_ucode)
+		err = g->ops.pmu.prepare_ucode(g);
+	if (err) {
+		gk20a_err(dev, "failed to init pmu ucode");
+		goto done;
+	}
+
+	err = gk20a_init_pmu_support(g);
+	if (err) {
+		gk20a_err(dev, "failed to init gk20a pmu");
 		goto done;
 	}
 
@@ -945,10 +887,21 @@ static int gk20a_pm_finalize_poweron(struct device *dev)
 		goto done;
 	}
 
+	/* Restore the debug setting */
+	gk20a_pm_restore_debug_setting(g);
+
 	gk20a_channel_resume(g);
 	set_user_nice(current, nice_value);
 
 	gk20a_scale_resume(pdev);
+
+	trace_gk20a_finalize_poweron_done(dev_name(dev));
+
+	if (platform->has_cde)
+		gk20a_init_cde_support(g);
+
+	enable_irq(g->irq_stall);
+	enable_irq(g->irq_nonstall);
 
 done:
 	return err;
@@ -958,57 +911,36 @@ static struct of_device_id tegra_gk20a_of_match[] = {
 #ifdef CONFIG_TEGRA_GK20A
 	{ .compatible = "nvidia,tegra124-gk20a",
 		.data = &gk20a_tegra_platform },
+	{ .compatible = "nvidia,tegra210-gm20b",
+		.data = &gm20b_tegra_platform },
+#ifdef CONFIG_ARCH_TEGRA_18x_SOC
+	{ .compatible = TEGRA_18x_GPU_COMPAT_TEGRA,
+		.data = &t18x_gpu_tegra_platform },
+#endif
+#ifdef CONFIG_TEGRA_GR_VIRTUALIZATION
+	{ .compatible = "nvidia,tegra124-gk20a-vgpu",
+		.data = &vgpu_tegra_platform },
+#endif
+#else
+	{ .compatible = "nvidia,tegra124-gk20a",
+		.data = &gk20a_generic_platform },
+	{ .compatible = "nvidia,tegra210-gm20b",
+		.data = &gk20a_generic_platform },
+#ifdef CONFIG_ARCH_TEGRA_18x_SOC
+	{ .compatible = TEGRA_18x_GPU_COMPAT_TEGRA,
+		.data = &gk20a_generic_platform },
+#endif
+
 #endif
 	{ .compatible = "nvidia,generic-gk20a",
 		.data = &gk20a_generic_platform },
+	{ .compatible = "nvidia,generic-gm20b",
+		.data = &gk20a_generic_platform },
+#ifdef CONFIG_ARCH_TEGRA_18x_SOC
+	{ .compatible = TEGRA_18x_GPU_COMPAT_GENERIC,
+		.data = &gk20a_generic_platform },
+#endif
 	{ },
-};
-
-int tegra_gpu_get_max_state(struct thermal_cooling_device *cdev,
-		unsigned long *max_state)
-{
-	struct cooling_device_gk20a *gk20a_gpufreq_device = cdev->devdata;
-
-	*max_state = gk20a_gpufreq_device->gk20a_freq_table_size - 1;
-	return 0;
-}
-
-int tegra_gpu_get_cur_state(struct thermal_cooling_device *cdev,
-		unsigned long *cur_state)
-{
-	struct cooling_device_gk20a  *gk20a_gpufreq_device = cdev->devdata;
-
-	*cur_state = gk20a_gpufreq_device->gk20a_freq_state;
-	return 0;
-}
-
-int tegra_gpu_set_cur_state(struct thermal_cooling_device *c_dev,
-		unsigned long cur_state)
-{
-	u32 target_freq;
-	struct gk20a *g;
-	struct gpufreq_table_data *gpu_cooling_table;
-	struct cooling_device_gk20a *gk20a_gpufreq_device = c_dev->devdata;
-
-	BUG_ON(cur_state >= gk20a_gpufreq_device->gk20a_freq_table_size);
-
-	g = container_of(gk20a_gpufreq_device, struct gk20a, gk20a_cdev);
-
-	gpu_cooling_table = tegra_gpufreq_table_get();
-	target_freq = gpu_cooling_table[cur_state].frequency;
-
-	/* ensure a query for state will get the proper value */
-	gk20a_gpufreq_device->gk20a_freq_state = cur_state;
-
-	gk20a_clk_set_rate(g, target_freq);
-
-	return 0;
-}
-
-static struct thermal_cooling_device_ops tegra_gpu_cooling_ops = {
-	.get_max_state = tegra_gpu_get_max_state,
-	.get_cur_state = tegra_gpu_get_cur_state,
-	.set_cur_state = tegra_gpu_set_cur_state,
 };
 
 static int gk20a_create_device(
@@ -1049,7 +981,7 @@ static int gk20a_create_device(
 	return 0;
 }
 
-static void gk20a_user_deinit(struct platform_device *dev)
+void gk20a_user_deinit(struct platform_device *dev)
 {
 	struct gk20a *g = get_gk20a(dev);
 
@@ -1078,6 +1010,11 @@ static void gk20a_user_deinit(struct platform_device *dev)
 		cdev_del(&g->prof.cdev);
 	}
 
+	if (g->tsg.node) {
+		device_destroy(g->class, g->tsg.cdev.dev);
+		cdev_del(&g->tsg.cdev);
+	}
+
 	if (g->cdev_region)
 		unregister_chrdev_region(g->cdev_region, GK20A_NUM_CDEVS);
 
@@ -1085,7 +1022,7 @@ static void gk20a_user_deinit(struct platform_device *dev)
 		class_destroy(g->class);
 }
 
-static int gk20a_user_init(struct platform_device *dev)
+int gk20a_user_init(struct platform_device *dev)
 {
 	int err;
 	dev_t devno;
@@ -1137,6 +1074,12 @@ static int gk20a_user_init(struct platform_device *dev)
 	if (err)
 		goto fail;
 
+	err = gk20a_create_device(dev, devno++, "-tsg",
+				  &g->tsg.cdev, &g->tsg.node,
+				  &gk20a_tsg_ops);
+	if (err)
+		goto fail;
+
 	return 0;
 fail:
 	gk20a_user_deinit(dev);
@@ -1148,11 +1091,11 @@ struct channel_gk20a *gk20a_get_channel_from_file(int fd)
 	struct channel_gk20a *ch;
 	struct file *f = fget(fd);
 	if (!f)
-		return 0;
+		return NULL;
 
 	if (f->f_op != &gk20a_channel_ops) {
 		fput(f);
-		return 0;
+		return NULL;
 	}
 
 	ch = (struct channel_gk20a *)f->private_data;
@@ -1170,7 +1113,9 @@ static int gk20a_pm_enable_clk(struct device *dev)
 		return -EINVAL;
 
 	for (index = 0; index < platform->num_clks; index++) {
-		int err = clk_prepare_enable(platform->clk[index]);
+		int err = 0;
+		if (platform->clk[index])
+			clk_prepare_enable(platform->clk[index]);
 		if (err)
 			return -EINVAL;
 	}
@@ -1187,20 +1132,69 @@ static int gk20a_pm_disable_clk(struct device *dev)
 	if (!platform)
 		return -EINVAL;
 
-	for (index = 0; index < platform->num_clks; index++)
-		clk_disable_unprepare(platform->clk[index]);
+	for (index = 0; index < platform->num_clks; index++) {
+		if (platform->clk[index])
+			clk_disable_unprepare(platform->clk[index]);
+	}
 
 	return 0;
 }
 
 static void gk20a_pm_shutdown(struct platform_device *pdev)
 {
+	struct gk20a_platform *platform = platform_get_drvdata(pdev);
+	int ret = 0;
+	struct gk20a *g = get_gk20a(pdev);
+	struct fifo_gk20a *f = &g->fifo;
+	int chid;
+
+	/* If GPU is already railgated, just prevent more requests, and return */
+	if (platform->is_railgated && platform->is_railgated(pdev)) {
+#ifdef CONFIG_PM_RUNTIME
+		__pm_runtime_disable(&pdev->dev, false);
+#endif
+		return;
+	}
+
 	dev_info(&pdev->dev, "shutting down");
+
+	ret = gk20a_busy(pdev);
+	if (ret)
+		goto fail;
+
+	gk20a_cde_suspend(g);
+
+	for (chid = 0; chid < f->num_channels; chid++) {
+		struct channel_gk20a *ch = &f->channel[chid];
+
+		if (gk20a_channel_get(ch)) {
+			gk20a_channel_abort(ch, true);
+			gk20a_channel_cancel_job_clean_up(ch, true);
+			if (ch->update_fn)
+				cancel_work_sync(&ch->update_fn_work);
+			gk20a_channel_put(ch);
+		}
+	}
+
+	gk20a_idle(pdev);
+
+fail:
+#ifdef CONFIG_PM_RUNTIME
+	/* Prevent more requests by disabling Runtime PM */
 	__pm_runtime_disable(&pdev->dev, false);
+#endif
+
+	/* Be ready for rail-gate after this point */
+	gk20a_pm_prepare_poweroff(&pdev->dev);
+
+	if (platform->railgate)
+		ret = platform->railgate(pdev);
+
+	dev_info(&pdev->dev, "shut down complete\n");
 }
 
 #ifdef CONFIG_PM
-const struct dev_pm_ops gk20a_pm_ops = {
+static const struct dev_pm_ops gk20a_pm_ops = {
 #if defined(CONFIG_PM_RUNTIME) && !defined(CONFIG_PM_GENERIC_DOMAINS)
 	.runtime_resume = gk20a_pm_enable_clk,
 	.runtime_suspend = gk20a_pm_disable_clk,
@@ -1208,28 +1202,46 @@ const struct dev_pm_ops gk20a_pm_ops = {
 };
 #endif
 
+static int _gk20a_pm_railgate(struct platform_device *pdev)
+{
+	struct gk20a_platform *platform = platform_get_drvdata(pdev);
+	int ret = 0;
+	if (platform->railgate)
+		ret = platform->railgate(pdev);
+	return ret;
+}
+
 static int gk20a_pm_railgate(struct generic_pm_domain *domain)
 {
-	struct gk20a *g = container_of(domain, struct gk20a, pd);
-	struct gk20a_platform *platform = platform_get_drvdata(g->dev);
+	struct gk20a_domain_data *gk20a_domain = container_of(domain,
+			   struct gk20a_domain_data, gpd);
+	struct gk20a *g = gk20a_domain->gk20a;
+
+	return _gk20a_pm_railgate(g->dev);
+}
+
+static int _gk20a_pm_unrailgate(struct platform_device *pdev)
+{
+	struct gk20a_platform *platform = platform_get_drvdata(pdev);
 	int ret = 0;
 
-	if (platform->railgate)
-		ret = platform->railgate(platform->g->dev);
+	if (platform->unrailgate) {
+		mutex_lock(&platform->railgate_lock);
+		ret = platform->unrailgate(pdev);
+		mutex_unlock(&platform->railgate_lock);
+	}
 
 	return ret;
 }
 
 static int gk20a_pm_unrailgate(struct generic_pm_domain *domain)
 {
-	struct gk20a *g = container_of(domain, struct gk20a, pd);
-	struct gk20a_platform *platform = platform_get_drvdata(g->dev);
-	int ret = 0;
+	struct gk20a_domain_data *gk20a_domain = container_of(domain,
+				     struct gk20a_domain_data, gpd);
+	struct gk20a *g = gk20a_domain->gk20a;
+	trace_gk20a_pm_unrailgate(dev_name(&g->dev->dev));
 
-	if (platform->unrailgate)
-		ret = platform->unrailgate(platform->g->dev);
-
-	return ret;
+	return _gk20a_pm_unrailgate(g->dev);
 }
 
 static int gk20a_pm_suspend(struct device *dev)
@@ -1237,8 +1249,10 @@ static int gk20a_pm_suspend(struct device *dev)
 	struct gk20a_platform *platform = dev_get_drvdata(dev);
 	int ret = 0;
 
+#ifdef CONFIG_PM_RUNTIME
 	if (atomic_read(&dev->power.usage_count) > 1)
 		return -EBUSY;
+#endif
 
 	ret = gk20a_pm_prepare_poweroff(dev);
 	if (ret)
@@ -1255,17 +1269,48 @@ static int gk20a_pm_resume(struct device *dev)
 	return gk20a_pm_finalize_poweron(dev);
 }
 
+#ifdef CONFIG_PM_GENERIC_DOMAINS_OF
 static int gk20a_pm_initialise_domain(struct platform_device *pdev)
 {
 	struct gk20a_platform *platform = platform_get_drvdata(pdev);
 	struct dev_power_governor *pm_domain_gov = NULL;
-	struct generic_pm_domain *domain = &platform->g->pd;
-	int ret = 0;
+	struct generic_pm_domain *domain = dev_to_genpd(&pdev->dev);
 
-	domain->name = kstrdup(pdev->name, GFP_KERNEL);
-
+#ifdef CONFIG_PM_RUNTIME
 	if (!platform->can_railgate)
 		pm_domain_gov = &pm_domain_always_on_gov;
+#endif
+	domain->gov = pm_domain_gov;
+
+	if (platform->railgate_delay)
+		pm_genpd_set_poweroff_delay(domain, platform->railgate_delay);
+
+	device_set_wakeup_capable(&pdev->dev, 0);
+	return 0;
+}
+
+#else
+static int gk20a_pm_initialise_domain(struct platform_device *pdev)
+{
+	struct gk20a_platform *platform = platform_get_drvdata(pdev);
+	struct dev_power_governor *pm_domain_gov = NULL;
+	struct generic_pm_domain *domain = NULL;
+	int ret = 0;
+	struct gk20a_domain_data *gpu_gpd_data = (struct gk20a_domain_data *)
+			kzalloc(sizeof(struct gk20a_domain_data), GFP_KERNEL);
+
+	if (!gpu_gpd_data)
+		return -ENOMEM;
+
+	gpu_gpd_data->gk20a = platform->g;
+	domain = &gpu_gpd_data->gpd;
+
+	domain->name = "gpu";
+
+#ifdef CONFIG_PM_RUNTIME
+	if (!platform->can_railgate)
+		pm_domain_gov = &pm_domain_always_on_gov;
+#endif
 
 	pm_genpd_init(domain, pm_domain_gov, true);
 
@@ -1286,11 +1331,16 @@ static int gk20a_pm_initialise_domain(struct platform_device *pdev)
 
 	return ret;
 }
+#endif
 
 static int gk20a_pm_init(struct platform_device *dev)
 {
 	struct gk20a_platform *platform = platform_get_drvdata(dev);
 	int err = 0;
+
+	gk20a_dbg_fn("");
+
+	mutex_init(&platform->railgate_lock);
 
 	/* Initialise pm runtime */
 	if (platform->clockgate_delay) {
@@ -1306,9 +1356,9 @@ static int gk20a_pm_init(struct platform_device *dev)
 	/* Enable runtime railgating if possible. If not,
 	 * turn on the rail now. */
 	if (platform->can_railgate && IS_ENABLED(CONFIG_PM_GENERIC_DOMAINS))
-		platform->railgate(dev);
-	else
-		platform->unrailgate(dev);
+		_gk20a_pm_railgate(dev);
+	else if (!IS_ENABLED(CONFIG_PM_GENERIC_DOMAINS))
+		_gk20a_pm_unrailgate(dev);
 
 	/* genpd will take care of runtime power management if it is enabled */
 	if (IS_ENABLED(CONFIG_PM_GENERIC_DOMAINS))
@@ -1317,21 +1367,53 @@ static int gk20a_pm_init(struct platform_device *dev)
 	return err;
 }
 
+static int gk20a_secure_page_alloc(struct platform_device *pdev)
+{
+	struct gk20a_platform *platform = platform_get_drvdata(pdev);
+	int err = 0;
+
+	if (platform->secure_page_alloc) {
+		tegra_periph_reset_assert(platform->clk[0]);
+		udelay(10);
+		err = platform->secure_page_alloc(pdev);
+		tegra_periph_reset_deassert(platform->clk[0]);
+	}
+
+	if (!err)
+		platform->secure_alloc_ready = true;
+
+	return err;
+}
+
+static struct of_device_id tegra_gpu_domain_match[] = {
+	{.compatible = "nvidia,tegra124-gpu-pd"},
+	{.compatible = "nvidia,tegra132-gpu-pd"},
+	{.compatible = "nvidia,tegra210-gpu-pd"},
+	{},
+};
+
 static int gk20a_probe(struct platform_device *dev)
 {
 	struct gk20a *gk20a;
 	int err;
 	struct gk20a_platform *platform = NULL;
-	struct cooling_device_gk20a *gpu_cdev = NULL;
+
+#ifdef CONFIG_PM_GENERIC_DOMAINS_OF
+	struct gk20a_domain_data *gk20a_domain;
+#endif
 
 	if (dev->dev.of_node) {
 		const struct of_device_id *match;
 
 		match = of_match_device(tegra_gk20a_of_match, &dev->dev);
-		if (match)
+		if (match) {
+			dev_info(&dev->dev, "load platform data from DT node.\n");
 			platform = (struct gk20a_platform *)match->data;
-	} else
+		}
+	} else {
+		dev_info(&dev->dev, "fallback and load predefined platform data.\n");
 		platform = (struct gk20a_platform *)dev->dev.platform_data;
+	}
 
 	if (!platform) {
 		dev_err(&dev->dev, "no platform data\n");
@@ -1342,23 +1424,63 @@ static int gk20a_probe(struct platform_device *dev)
 
 	platform_set_drvdata(dev, platform);
 
+	if (gk20a_gpu_is_virtual(dev))
+		return vgpu_probe(dev);
+
 	gk20a = kzalloc(sizeof(struct gk20a), GFP_KERNEL);
 	if (!gk20a) {
 		dev_err(&dev->dev, "couldn't allocate gk20a support");
 		return -ENOMEM;
 	}
 
+	init_waitqueue_head(&gk20a->sw_irq_stall_last_handled_wq);
+	init_waitqueue_head(&gk20a->sw_irq_nonstall_last_handled_wq);
+
+#ifdef CONFIG_PM_GENERIC_DOMAINS_OF
+	gk20a_domain = container_of(dev_to_genpd(&dev->dev),
+			     struct gk20a_domain_data, gpd);
+	gk20a_domain->gk20a = gk20a;
+#endif
+
 	set_gk20a(dev, gk20a);
 	gk20a->dev = dev;
-#ifdef CONFIG_TEGRA_GK20A
-	gk20a->host = nvhost_get_host(dev);
-#endif
+
+	gk20a->irq_stall = platform_get_irq(dev, 0);
+	gk20a->irq_nonstall = platform_get_irq(dev, 1);
+	if (gk20a->irq_stall < 0 || gk20a->irq_nonstall < 0)
+		return -ENXIO;
+	err = devm_request_threaded_irq(&dev->dev,
+			gk20a->irq_stall,
+			gk20a_intr_isr_stall,
+			gk20a_intr_thread_stall,
+			0, "gk20a_stall", gk20a);
+	if (err) {
+		dev_err(&dev->dev,
+			"failed to request stall intr irq @ %d\n",
+				gk20a->irq_stall);
+		return err;
+	}
+	err = devm_request_threaded_irq(&dev->dev,
+			gk20a->irq_nonstall,
+			gk20a_intr_isr_nonstall,
+			gk20a_intr_thread_nonstall,
+			0, "gk20a_nonstall", gk20a);
+	if (err) {
+		dev_err(&dev->dev,
+			"failed to request non-stall intr irq @ %d\n",
+				gk20a->irq_nonstall);
+		return err;
+	}
+	disable_irq(gk20a->irq_stall);
+	disable_irq(gk20a->irq_nonstall);
 
 	err = gk20a_user_init(dev);
 	if (err)
 		return err;
 
 	gk20a_init_support(dev);
+
+	init_rwsem(&gk20a->busy_lock);
 
 	spin_lock_init(&gk20a->mc_enable_lock);
 
@@ -1375,6 +1497,8 @@ static int gk20a_probe(struct platform_device *dev)
 		return err;
 	}
 
+	gk20a->emc3d_ratio = EMC3D_DEFAULT_RATIO;
+
 	/* Initialise scaling */
 	if (IS_ENABLED(CONFIG_GK20A_DEVFREQ))
 		gk20a_scale_init(dev);
@@ -1387,40 +1511,50 @@ static int gk20a_probe(struct platform_device *dev)
 		}
 	}
 
+	err = gk20a_secure_page_alloc(dev);
+	if (err)
+		dev_err(&dev->dev,
+			"failed to allocate secure buffer %d\n", err);
+
 	gk20a_debug_init(dev);
 
 	/* Set DMA parameters to allow larger sgt lists */
 	dev->dev.dma_parms = &gk20a->dma_parms;
 	dma_set_max_seg_size(&dev->dev, UINT_MAX);
 
-	gpu_cdev = &gk20a->gk20a_cdev;
-	gpu_cdev->gk20a_freq_table_size = tegra_gpufreq_table_size_get();
-	gpu_cdev->gk20a_freq_state = 0;
-	gpu_cdev->g = gk20a;
-	gpu_cdev->gk20a_cooling_dev = thermal_cooling_device_register("gk20a_cdev", gpu_cdev,
-					&tegra_gpu_cooling_ops);
-
 	gk20a->gr_idle_timeout_default =
 			CONFIG_GK20A_DEFAULT_TIMEOUT;
-	gk20a->timeouts_enabled = true;
+	if (tegra_platform_is_silicon())
+		gk20a->timeouts_enabled = true;
 
-	/* Set up initial clock gating settings */
-	if (tegra_platform_is_silicon()) {
-		gk20a->slcg_enabled = true;
-		gk20a->blcg_enabled = true;
-		gk20a->elcg_enabled = true;
-		gk20a->elpg_enabled = true;
-		gk20a->aelpg_enabled = true;
-	}
+	/* Set up initial power settings. For non-slicon platforms, disable *
+	 * power features and for silicon platforms, read from platform data */
+	gk20a->slcg_enabled =
+		tegra_platform_is_silicon() ? platform->enable_slcg : false;
+	gk20a->blcg_enabled =
+		tegra_platform_is_silicon() ? platform->enable_blcg : false;
+	gk20a->elcg_enabled =
+		tegra_platform_is_silicon() ? platform->enable_elcg : false;
+	gk20a->elpg_enabled =
+		tegra_platform_is_silicon() ? platform->enable_elpg : false;
+	gk20a->aelpg_enabled =
+		tegra_platform_is_silicon() ? platform->enable_aelpg : false;
+
+	/* set default values to aelpg parameters */
+	gk20a->pmu.aelpg_param[0] = APCTRL_SAMPLING_PERIOD_PG_DEFAULT_US;
+	gk20a->pmu.aelpg_param[1] = APCTRL_MINIMUM_IDLE_FILTER_DEFAULT_US;
+	gk20a->pmu.aelpg_param[2] = APCTRL_MINIMUM_TARGET_SAVING_DEFAULT_US;
+	gk20a->pmu.aelpg_param[3] = APCTRL_POWER_BREAKEVEN_DEFAULT_US;
+	gk20a->pmu.aelpg_param[4] = APCTRL_CYCLES_PER_SAMPLE_MAX_DEFAULT;
 
 	gk20a_create_sysfs(dev);
 
 #ifdef CONFIG_DEBUG_FS
-	clk_gk20a_debugfs_init(dev);
-
 	spin_lock_init(&gk20a->debugfs_lock);
 	gk20a->mm.ltc_enabled = true;
 	gk20a->mm.ltc_enabled_debug = true;
+	gk20a->mm.bypass_smmu = platform->bypass_smmu;
+	gk20a->mm.disable_bigpage = platform->disable_bigpage;
 	gk20a->debugfs_ltc_enabled =
 			debugfs_create_bool("ltc_enabled", S_IRUGO|S_IWUSR,
 				 platform->debugfs,
@@ -1435,11 +1569,20 @@ static int gk20a_probe(struct platform_device *dev)
 					S_IRUGO|S_IWUSR,
 					platform->debugfs,
 					&gk20a->timeouts_enabled);
+	gk20a->debugfs_bypass_smmu =
+			debugfs_create_bool("bypass_smmu",
+					S_IRUGO|S_IWUSR,
+					platform->debugfs,
+					&gk20a->mm.bypass_smmu);
+	gk20a->debugfs_disable_bigpage =
+			debugfs_create_bool("disable_bigpage",
+					S_IRUGO|S_IWUSR,
+					platform->debugfs,
+					&gk20a->mm.disable_bigpage);
+	gr_gk20a_debugfs_init(gk20a);
 	gk20a_pmu_debugfs_init(dev);
-#endif
-
-#ifdef CONFIG_INPUT_CFBOOST
-	cfb_add_device(&dev->dev);
+	gk20a_cde_debugfs_init(dev);
+	gk20a_alloc_debugfs_init(dev);
 #endif
 
 	gk20a_init_gr(gk20a);
@@ -1450,32 +1593,49 @@ static int gk20a_probe(struct platform_device *dev)
 static int __exit gk20a_remove(struct platform_device *dev)
 {
 	struct gk20a *g = get_gk20a(dev);
+	struct gk20a_platform *platform = gk20a_get_platform(dev);
+	struct gk20a_domain_data *gk20a_gpd;
+
 	gk20a_dbg_fn("");
 
-#ifdef CONFIG_INPUT_CFBOOST
-	cfb_remove_device(&dev->dev);
-#endif
+	if (gk20a_gpu_is_virtual(dev))
+		return vgpu_remove(dev);
+
+	if (platform->has_cde)
+		gk20a_cde_destroy(g);
+
+	if (IS_ENABLED(CONFIG_GK20A_DEVFREQ))
+		gk20a_scale_exit(dev);
 
 	if (g->remove_support)
 		g->remove_support(dev);
 
 	gk20a_user_deinit(dev);
 
-	set_gk20a(dev, 0);
-#ifdef CONFIG_DEBUG_FS
-	debugfs_remove(g->debugfs_ltc_enabled);
-	debugfs_remove(g->debugfs_gr_idle_timeout_default);
-	debugfs_remove(g->debugfs_timeouts_enabled);
-#endif
+	debugfs_remove_recursive(platform->debugfs);
 
+	gk20a_remove_sysfs(&dev->dev);
+
+	if (platform->secure_buffer.destroy)
+		platform->secure_buffer.destroy(dev,
+				&platform->secure_buffer);
+
+	gk20a_gpd = container_of(&g, struct gk20a_domain_data, gk20a);
+	gk20a_gpd->gk20a = NULL;
+	kfree(gk20a_gpd);
+
+	if (pm_runtime_enabled(&dev->dev))
+		pm_runtime_disable(&dev->dev);
+	else
+		gk20a_pm_disable_clk(&dev->dev);
+
+	if (platform->remove)
+		platform->remove(dev);
+
+	set_gk20a(dev, NULL);
 	kfree(g);
 
-#ifdef CONFIG_PM_RUNTIME
-	pm_runtime_put(&dev->dev);
-	pm_runtime_disable(&dev->dev);
-#else
-	nvhost_module_disable_clk(&dev->dev);
-#endif
+	gk20a_dbg_fn("removed");
 
 	return 0;
 }
@@ -1496,19 +1656,81 @@ static struct platform_driver gk20a_driver = {
 	}
 };
 
+#ifdef CONFIG_PM_GENERIC_DOMAINS_OF
+
+
+static int _gk20a_init_domain(struct device_node *np,
+			      struct generic_pm_domain *gpd)
+{
+	bool is_off = false;
+
+	gpd->name = (char *)np->name;
+
+	if (of_property_read_bool(np, "is_off"))
+		is_off = true;
+
+	pm_genpd_init(gpd, NULL, is_off);
+
+	gpd->power_on = gk20a_pm_unrailgate;
+	gpd->power_off = gk20a_pm_railgate;
+	gpd->dev_ops.start = gk20a_pm_enable_clk;
+	gpd->dev_ops.stop = gk20a_pm_disable_clk;
+	gpd->dev_ops.save_state = gk20a_pm_prepare_poweroff;
+	gpd->dev_ops.restore_state = gk20a_pm_finalize_poweron;
+	gpd->dev_ops.suspend = gk20a_pm_suspend;
+	gpd->dev_ops.resume = gk20a_pm_resume;
+
+	of_genpd_add_provider_simple(np, gpd);
+	gpd->of_node = of_node_get(np);
+
+	genpd_pm_subdomain_attach(gpd);
+	return 0;
+}
+
+static int gk20a_domain_init(struct of_device_id *matches)
+{
+	int ret = 0;
+	struct device_node *np;
+	const struct of_device_id *match;
+	struct gk20a_domain_data *gk20a_domain;
+
+	np = of_find_matching_node(NULL, matches);
+	if (!np)
+		return -ENOENT;
+
+	match = of_match_node(matches, np);
+	gk20a_domain = (struct gk20a_domain_data *)kzalloc
+		       (sizeof(struct gk20a_domain_data), GFP_KERNEL);
+	if (!gk20a_domain)
+		return -ENOMEM;
+
+	ret = _gk20a_init_domain(np, &gk20a_domain->gpd);
+
+	return ret;
+}
+#else
+static int gk20a_domain_init(struct of_device_id *matches)
+{
+	return 0;
+}
+#endif
+
+
 static int __init gk20a_init(void)
 {
+
+	int ret;
+
+	ret = gk20a_domain_init(tegra_gpu_domain_match);
+	if (ret)
+		return ret;
+
 	return platform_driver_register(&gk20a_driver);
 }
 
 static void __exit gk20a_exit(void)
 {
 	platform_driver_unregister(&gk20a_driver);
-}
-
-bool is_gk20a_module(struct platform_device *dev)
-{
-	return &gk20a_driver.driver == dev->dev.driver;
 }
 
 void gk20a_busy_noresume(struct platform_device *pdev)
@@ -1519,13 +1741,43 @@ void gk20a_busy_noresume(struct platform_device *pdev)
 int gk20a_busy(struct platform_device *pdev)
 {
 	int ret = 0;
+	struct gk20a *g = get_gk20a(pdev);
+#ifdef CONFIG_PM_RUNTIME
+	struct gk20a_platform *platform = gk20a_get_platform(pdev);
+#endif
+
+	down_read(&g->busy_lock);
 
 #ifdef CONFIG_PM_RUNTIME
+	if (platform->busy) {
+		ret = platform->busy(pdev);
+		if (ret < 0) {
+			dev_err(&pdev->dev, "%s: failed to poweron platform dependency\n",
+				__func__);
+			goto fail;
+		}
+	}
+
 	ret = pm_runtime_get_sync(&pdev->dev);
-	if (ret < 0)
+	if (ret < 0) {
 		pm_runtime_put_noidle(&pdev->dev);
+		if (platform->idle)
+			platform->idle(pdev);
+		goto fail;
+	}
+#else
+	if (!g->power_on) {
+		ret = gk20a_gpu_is_virtual(pdev) ?
+			vgpu_pm_finalize_poweron(&pdev->dev)
+			: gk20a_pm_finalize_poweron(&pdev->dev);
+		if (ret)
+			goto fail;
+	}
 #endif
 	gk20a_scale_notify_busy(pdev);
+
+fail:
+	up_read(&g->busy_lock);
 
 	return ret < 0 ? ret : 0;
 }
@@ -1533,10 +1785,14 @@ int gk20a_busy(struct platform_device *pdev)
 void gk20a_idle(struct platform_device *pdev)
 {
 #ifdef CONFIG_PM_RUNTIME
+	struct gk20a_platform *platform = gk20a_get_platform(pdev);
 	if (atomic_read(&pdev->dev.power.usage_count) == 1)
 		gk20a_scale_notify_idle(pdev);
 	pm_runtime_mark_last_busy(&pdev->dev);
 	pm_runtime_put_sync_autosuspend(&pdev->dev);
+
+	if (platform->idle)
+		platform->idle(pdev);
 #else
 	gk20a_scale_notify_idle(pdev);
 #endif
@@ -1578,36 +1834,257 @@ void gk20a_reset(struct gk20a *g, u32 units)
 	gk20a_enable(g, units);
 }
 
+#ifdef CONFIG_PM_RUNTIME
+/**
+ * __gk20a_do_idle() - force the GPU to idle and railgate
+ *
+ * In success, this call MUST be balanced by caller with __gk20a_do_unidle()
+ *
+ * Acquires two locks : &g->busy_lock and &platform->railgate_lock
+ * In success, we hold these locks and return
+ * In failure, we release these locks and return
+ */
+int __gk20a_do_idle(struct platform_device *pdev, bool force_reset)
+{
+	struct gk20a *g = get_gk20a(pdev);
+	struct gk20a_platform *platform = dev_get_drvdata(&pdev->dev);
+	unsigned long timeout = jiffies +
+		msecs_to_jiffies(GK20A_WAIT_FOR_IDLE_MS);
+	int ref_cnt;
+	bool is_railgated;
+
+	/* acquire busy lock to block other busy() calls */
+	down_write(&g->busy_lock);
+
+	/* acquire railgate lock to prevent unrailgate in midst of do_idle() */
+	mutex_lock(&platform->railgate_lock);
+
+	/* check if it is already railgated ? */
+	if (platform->is_railgated(pdev))
+		return 0;
+
+	/*
+	 * release railgate_lock, prevent suspend by incrementing usage counter,
+	 * re-acquire railgate_lock
+	 */
+	mutex_unlock(&platform->railgate_lock);
+	pm_runtime_get_sync(&pdev->dev);
+	mutex_lock(&platform->railgate_lock);
+
+	/* check and wait until GPU is idle (with a timeout) */
+	do {
+		msleep(1);
+		ref_cnt = atomic_read(&pdev->dev.power.usage_count);
+	} while (ref_cnt != 1 && time_before(jiffies, timeout));
+
+	if (ref_cnt != 1) {
+		gk20a_err(&pdev->dev, "failed to idle - refcount %d != 1\n",
+			ref_cnt);
+		goto fail_drop_usage_count;
+	}
+
+	/* check if global force_reset flag is set */
+	force_reset |= platform->force_reset_in_do_idle;
+
+	if (platform->can_railgate && !force_reset) {
+		/*
+		 * Case 1 : GPU railgate is supported
+		 *
+		 * if GPU is now idle, we will have only one ref count,
+		 * drop this ref which will rail gate the GPU
+		 */
+		pm_runtime_put_sync(&pdev->dev);
+
+		/* add sufficient delay to allow GPU to rail gate */
+		msleep(platform->railgate_delay);
+
+		timeout = jiffies + msecs_to_jiffies(GK20A_WAIT_FOR_IDLE_MS);
+
+		/* check in loop if GPU is railgated or not */
+		do {
+			msleep(1);
+			is_railgated = platform->is_railgated(pdev);
+		} while (!is_railgated && time_before(jiffies, timeout));
+
+		if (is_railgated) {
+			return 0;
+		} else {
+			gk20a_err(&pdev->dev, "failed to idle in timeout\n");
+			goto fail_timeout;
+		}
+	} else {
+		/*
+		 * Case 2 : GPU railgate is not supported or we explicitly
+		 * do not want to do railgate
+		 *
+		 * if GPU is now idle, call prepare_poweroff() to save the
+		 * state and then assert the reset
+		 *
+		 * __gk20a_do_unidle() needs to deassert reset, call
+		 * finalize_poweron(), and then call pm_runtime_put_sync()
+		 * to balance the GPU usage counter
+		 */
+		if (!platform->reset_assert || !platform->reset_deassert)
+			goto fail_drop_usage_count;
+
+		/* Save the GPU state */
+		gk20a_pm_prepare_poweroff(&pdev->dev);
+
+		/* assert GPU reset */
+		platform->reset_assert(pdev);
+
+		udelay(10);
+
+		g->forced_reset = true;
+		return 0;
+	}
+
+fail_drop_usage_count:
+	pm_runtime_put_noidle(&pdev->dev);
+fail_timeout:
+	mutex_unlock(&platform->railgate_lock);
+	up_write(&g->busy_lock);
+	return -EBUSY;
+}
+
+/**
+ * gk20a_do_idle() - wrap up for __gk20a_do_idle() to be called
+ * from outside of GPU driver
+ *
+ * In success, this call MUST be balanced by caller with gk20a_do_unidle()
+ */
+int gk20a_do_idle(void)
+{
+	struct device_node *node =
+			of_find_matching_node(NULL, tegra_gk20a_of_match);
+	struct platform_device *pdev = of_find_device_by_node(node);
+
+	int ret =  __gk20a_do_idle(pdev, true);
+
+	of_node_put(node);
+
+	return ret;
+}
+
+/**
+ * __gk20a_do_unidle() - unblock all the tasks blocked by __gk20a_do_idle()
+ */
+int __gk20a_do_unidle(struct platform_device *pdev)
+{
+	struct gk20a *g = get_gk20a(pdev);
+	struct gk20a_platform *platform = dev_get_drvdata(&pdev->dev);
+
+	if (g->forced_reset) {
+		/*
+		 * If we did a reset (and not railgate),
+		 * then deassert the GPU reset here first
+		 */
+		platform->reset_deassert(pdev);
+
+		/* restore the GPU state */
+		gk20a_pm_finalize_poweron(&pdev->dev);
+
+		/* balance GPU usage counter */
+		pm_runtime_put_sync(&pdev->dev);
+
+		g->forced_reset = false;
+	}
+
+	/* release the lock and open up all other busy() calls */
+	mutex_unlock(&platform->railgate_lock);
+	up_write(&g->busy_lock);
+
+	return 0;
+}
+
+/**
+ * gk20a_do_unidle() - wrap up for __gk20a_do_unidle()
+ */
+int gk20a_do_unidle(void)
+{
+	struct device_node *node =
+			of_find_matching_node(NULL, tegra_gk20a_of_match);
+	struct platform_device *pdev = of_find_device_by_node(node);
+
+	int ret = __gk20a_do_unidle(pdev);
+
+	of_node_put(node);
+
+	return ret;
+}
+#endif
+
 int gk20a_init_gpu_characteristics(struct gk20a *g)
 {
-	struct nvhost_gpu_characteristics *gpu = &g->gpu_characteristics;
+	struct nvgpu_gpu_characteristics *gpu = &g->gpu_characteristics;
 
 	gpu->L2_cache_size = g->ops.ltc.determine_L2_size_bytes(g);
 	gpu->on_board_video_memory_size = 0; /* integrated GPU */
 
 	gpu->num_gpc = g->gr.gpc_count;
+	gpu->max_gpc_count = g->gr.gpc_count;
+
 	gpu->num_tpc_per_gpc = g->gr.max_tpc_per_gpc_count;
 
-	gpu->bus_type = NVHOST_GPU_BUS_TYPE_AXI; /* always AXI for now */
+	gpu->bus_type = NVGPU_GPU_BUS_TYPE_AXI; /* always AXI for now */
 
-	gpu->big_page_size = g->mm.big_page_size;
-	gpu->compression_page_size = g->mm.compression_page_size;
+	gpu->big_page_size = g->mm.pmu.vm.big_page_size;
+	gpu->compression_page_size = g->ops.fb.compression_page_size(g);
+	gpu->pde_coverage_bit_count =
+		gk20a_mm_pde_coverage_bit_count(&g->mm.pmu.vm);
 
-	return 0;
-}
-
-int nvhost_vpr_info_fetch(void)
-{
-	struct gk20a *g = get_gk20a(to_platform_device(
-			bus_find_device_by_name(&platform_bus_type,
-			NULL, "gk20a.0")));
-
-	if (!g) {
-		pr_info("gk20a ins't ready yet\n");
-		return 0;
+	if (g->mm.disable_bigpage) {
+		gpu->big_page_size = 0;
+		gpu->available_big_page_sizes = 0;
+	} else {
+		gpu->available_big_page_sizes = gpu->big_page_size;
+		if (g->ops.mm.get_big_page_sizes)
+			gpu->available_big_page_sizes |= g->ops.mm.get_big_page_sizes();
 	}
 
-	return gk20a_mm_mmu_vpr_info_fetch(g);
+	gpu->flags = NVGPU_GPU_FLAGS_SUPPORT_PARTIAL_MAPPINGS
+		| NVGPU_GPU_FLAGS_SUPPORT_SYNC_FENCE_FDS;
+
+	if (g->ops.mm.support_sparse && g->ops.mm.support_sparse(g))
+		gpu->flags |= NVGPU_GPU_FLAGS_SUPPORT_SPARSE_ALLOCS;
+
+	if (IS_ENABLED(CONFIG_TEGRA_GK20A) &&
+	    gk20a_platform_has_syncpoints(g->dev))
+		gpu->flags |= NVGPU_GPU_FLAGS_HAS_SYNCPOINTS;
+
+	gpu->flags |= NVGPU_GPU_FLAGS_SUPPORT_USERSPACE_MANAGED_AS;
+
+	gpu->gpc_mask = 1;
+
+	g->ops.gr.detect_sm_arch(g);
+
+	if (g->ops.gr.init_cyclestats)
+		g->ops.gr.init_cyclestats(g);
+
+	gpu->gpu_ioctl_nr_last = NVGPU_GPU_IOCTL_LAST;
+	gpu->tsg_ioctl_nr_last = NVGPU_TSG_IOCTL_LAST;
+	gpu->dbg_gpu_ioctl_nr_last = NVGPU_DBG_GPU_IOCTL_LAST;
+	gpu->ioctl_channel_nr_last = NVGPU_IOCTL_CHANNEL_LAST;
+	gpu->as_ioctl_nr_last = NVGPU_AS_IOCTL_LAST;
+	gpu->gpu_va_bit_count = 40;
+
+	memcpy(gpu->chipname, g->ops.name, strlen(g->ops.name));
+	gpu->max_fbps_count = g->ops.gr.get_max_fbps_count(g);
+	gpu->fbp_en_mask = g->ops.gr.get_fbp_en_mask(g);
+	gpu->max_ltc_per_fbp =  g->ops.gr.get_max_ltc_per_fbp(g);
+	gpu->max_lts_per_ltc = g->ops.gr.get_max_lts_per_ltc(g);
+	g->ops.gr.get_rop_l2_en_mask(g);
+	gpu->gr_compbit_store_base_hw = g->gr.compbit_store.base_hw;
+	gpu->gr_gobs_per_comptagline_per_slice =
+		g->gr.gobs_per_comptagline_per_slice;
+	gpu->num_ltc = g->ltc_count;
+	gpu->lts_per_ltc = g->gr.slices_per_ltc;
+	gpu->cbc_cache_line_size = g->gr.cacheline_size;
+	gpu->cbc_comptags_per_line = g->gr.comptags_per_cacheline;
+
+	gpu->map_buffer_batch_limit = 256;
+
+	return 0;
 }
 
 static const struct firmware *
@@ -1658,6 +2135,7 @@ gk20a_request_firmware(struct gk20a *g, const char *fw_name)
 	if (!fw)
 		fw = nvhost_client_request_firmware(g->dev, fw_name);
 #endif
+
 	if (!fw) {
 		dev_err(dev, "failed to get firmware\n");
 		return NULL;
@@ -1666,5 +2144,6 @@ gk20a_request_firmware(struct gk20a *g, const char *fw_name)
 	return fw;
 }
 
+MODULE_LICENSE("GPL v2");
 module_init(gk20a_init);
 module_exit(gk20a_exit);

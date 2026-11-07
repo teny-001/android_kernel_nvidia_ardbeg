@@ -1,7 +1,7 @@
 /*
  * drivers/video/tegra/dc/nvsd.c
  *
- * Copyright (c) 2010-2014, NVIDIA CORPORATION, All rights reserved.
+ * Copyright (c) 2010-2016, NVIDIA CORPORATION, All rights reserved.
  *
  * This software is licensed under the terms of the GNU General Public
  * License version 2, as published by the Free Software Foundation, and
@@ -41,7 +41,11 @@ static ssize_t nvsd_settings_store(struct kobject *kobj,
 static ssize_t nvsd_registers_show(struct kobject *kobj,
 	struct kobj_attribute *attr, char *buf);
 
+static int nvsd_is_enabled(struct tegra_dc_sd_settings *settings);
+
 NVSD_ATTR(enable);
+NVSD_ATTR(turn_off_brightness);
+NVSD_ATTR(turn_on_brightness);
 NVSD_ATTR(aggressiveness);
 NVSD_ATTR(phase_in_settings);
 NVSD_ATTR(phase_in_adjustments);
@@ -72,6 +76,8 @@ static struct kobj_attribute nvsd_attr_registers =
 
 static struct attribute *nvsd_attrs[] = {
 	NVSD_ATTRS_ENTRY(enable),
+	NVSD_ATTRS_ENTRY(turn_off_brightness),
+	NVSD_ATTRS_ENTRY(turn_on_brightness),
 	NVSD_ATTRS_ENTRY(aggressiveness),
 	NVSD_ATTRS_ENTRY(phase_in_settings),
 	NVSD_ATTRS_ENTRY(phase_in_adjustments),
@@ -113,6 +119,19 @@ static atomic_t *_sd_brightness;
 static atomic_t man_k_until_blank = ATOMIC_INIT(0);
 
 static u16 smooth_k_frames_left;
+
+/* HW bug 1155091:
+   The field DC_DISP_SD_BL_CONTROL[BRIGHTNESS] will never reach 0xff
+   (indicating to SW to keep brightness at 100%). The field's max value is
+   influenced by the field DC_DISP_SD_CONTROL[BIAS0]. The following table is
+   used to scale BRIGHTNESS by the correct max value expected from HW. */
+u8 bias0_to_max_bl[4] = {
+	0xfb, /* BIAS0 */
+	0xfd, /* BIAS1 */
+	0xfb, /* BIAS_HALF */
+	0xfd  /* BIAS_MBS */
+};
+
 static u16 smooth_k_duration_frames;
 
 static u8 nvsd_get_bw_idx(struct tegra_dc_sd_settings *settings)
@@ -175,6 +194,9 @@ static bool nvsd_phase_in_adjustments(struct tegra_dc *dc,
 	/* read brightness value */
 	val = tegra_dc_readl(dc, DC_DISP_SD_BL_CONTROL);
 	val = SD_BLC_BRIGHTNESS(val);
+	val = min(val * BRIGHTNESS_THEORETICAL_MAX /
+		bias0_to_max_bl[settings->bias0],
+		BRIGHTNESS_THEORETICAL_MAX);
 
 	step = settings->phase_adj_step;
 	if (cur_sd_brightness != val || target_k != cur_k) {
@@ -308,31 +330,6 @@ static void nvsd_cmd_handler(struct tegra_dc_sd_settings *settings,
 	}
 }
 
-static bool nvsd_update_enable(struct tegra_dc_sd_settings *settings,
-	int enable_val)
-{
-
-	if (enable_val != 1 && enable_val != 0)
-		return false;
-
-	if (!settings->cmd && settings->enable != enable_val) {
-		settings->num_phase_in_steps =
-			STEPS_PER_AGG_LVL*settings->aggressiveness;
-		settings->phase_settings_step = enable_val ?
-			0 : settings->num_phase_in_steps;
-	}
-
-	if (settings->enable != enable_val || settings->cmd & DISABLE) {
-		settings->cmd &= ~(ENABLE | DISABLE);
-		if (!settings->enable && enable_val)
-			settings->cmd |= PHASE_IN;
-		settings->cmd |= enable_val ? ENABLE : DISABLE;
-		return true;
-	}
-
-	return false;
-}
-
 static bool nvsd_update_agg(struct tegra_dc_sd_settings *settings, int agg_val)
 {
 	int i;
@@ -358,7 +355,7 @@ static bool nvsd_update_agg(struct tegra_dc_sd_settings *settings, int agg_val)
 	pri_lvl = i;
 	agg_lvl = sd_agg_priorities->agg[i];
 
-	if (settings->phase_in_settings && settings->enable &&
+	if (settings->phase_in_settings && nvsd_is_enabled(settings) &&
 		settings->aggressiveness != agg_lvl) {
 
 		settings->final_agg = agg_lvl;
@@ -384,13 +381,12 @@ void nvsd_init(struct tegra_dc *dc, struct tegra_dc_sd_settings *settings)
 
 	tegra_dc_io_start(dc);
 	/* If SD's not present or disabled, clear the register and return. */
-	if (!settings || settings->enable == 0) {
-		/* clear the brightness val, too. */
-		if (_sd_brightness)
-			atomic_set(_sd_brightness, 255);
-
-		_sd_brightness = NULL;
-
+	if (!settings || nvsd_is_enabled(settings) == 0) {
+		if (dc->ndev->id == 0) {
+			/* clear the brightness val, too. */
+			if (_sd_brightness)
+				atomic_set(_sd_brightness, 255);
+		}
 		if (settings)
 			settings->phase_settings_step = 0;
 		tegra_dc_writel(dc, 0, DC_DISP_SD_CONTROL);
@@ -480,7 +476,7 @@ void nvsd_init(struct tegra_dc *dc, struct tegra_dc_sd_settings *settings)
 	if (!settings->cmd && settings->phase_in_settings) {
 		settings->num_phase_in_steps = STEPS_PER_AGG_LVL *
 			settings->aggressiveness;
-		settings->phase_settings_step = settings->enable ?
+		settings->phase_settings_step = nvsd_is_enabled(settings) ?
 			settings->num_phase_in_steps : 0;
 	}
 
@@ -594,6 +590,7 @@ void nvsd_init(struct tegra_dc *dc, struct tegra_dc_sd_settings *settings)
 	val |= (settings->smooth_k_enable) ? SD_SMOOTH_K_ENABLE : 0;
 	/* SD proc control */
 	val |= (settings->use_vpulse2) ? SD_VPULSE2 : SD_VSYNC;
+	val |= settings->bias0 ? SD_BIAS0(settings->bias0) : 0;
 #endif
 	/* Finally, Write SD Control */
 	tegra_dc_writel(dc, val, DC_DISP_SD_CONTROL);
@@ -606,6 +603,7 @@ void nvsd_init(struct tegra_dc *dc, struct tegra_dc_sd_settings *settings)
 	/* note that we're in manual K until the next flip */
 	atomic_set(&man_k_until_blank, 1);
 }
+EXPORT_SYMBOL(nvsd_init);
 
 static int bl_tf[17] = {
 				57,  65,  73,  82,  92,
@@ -728,8 +726,13 @@ bool nvsd_update_brightness(struct tegra_dc *dc)
 	u32 val = 0;
 	int cur_sd_brightness;
 	int sw_sd_brightness;
-	struct tegra_dc_sd_settings *settings = dc->out->sd_settings;
 	bool nvsd_updated = false;
+	struct tegra_dc_sd_settings *settings;
+
+	if (dc->out && dc->out->sd_settings)
+		settings = dc->out->sd_settings;
+	else
+		return false;
 
 	if (_sd_brightness) {
 		if (atomic_read(&man_k_until_blank) &&
@@ -744,7 +747,7 @@ bool nvsd_update_brightness(struct tegra_dc *dc)
 			nvsd_cmd_handler(settings, dc);
 
 		/* nvsd_cmd_handler may turn off didim */
-		if (!settings->enable)
+		if (!nvsd_is_enabled(settings))
 			return true;
 
 		cur_sd_brightness = atomic_read(_sd_brightness);
@@ -752,6 +755,9 @@ bool nvsd_update_brightness(struct tegra_dc *dc)
 		/* read brightness value */
 		val = tegra_dc_readl(dc, DC_DISP_SD_BL_CONTROL);
 		val = SD_BLC_BRIGHTNESS(val);
+		val = min(val * BRIGHTNESS_THEORETICAL_MAX /
+			bias0_to_max_bl[settings->bias0],
+			BRIGHTNESS_THEORETICAL_MAX);
 
 		/* PRISM is updated by hw or sw algorithm. Brightness is
 		 * compensated according to histogram for soft-clipping
@@ -777,10 +783,10 @@ bool nvsd_update_brightness(struct tegra_dc *dc)
 		}
 
 		if (settings->smooth_k_enable) {
-			if (smooth_k_frames_left--)
+			if (smooth_k_frames_left) {
+				smooth_k_frames_left--;
 				return true;
-			else
-				smooth_k_frames_left = smooth_k_duration_frames;
+			}
 		}
 	}
 
@@ -849,6 +855,12 @@ static ssize_t nvsd_settings_show(struct kobject *kobj,
 		if (IS_NVSD_ATTR(enable))
 			res = snprintf(buf, PAGE_SIZE, "%d\n",
 				sd_settings->enable);
+		else if (IS_NVSD_ATTR(turn_off_brightness))
+			res = snprintf(buf, PAGE_SIZE, "%d\n",
+				sd_settings->turn_off_brightness);
+		else if (IS_NVSD_ATTR(turn_on_brightness))
+			res = snprintf(buf, PAGE_SIZE, "%d\n",
+				sd_settings->turn_on_brightness);
 		else if (IS_NVSD_ATTR(aggressiveness))
 			res = snprintf(buf, PAGE_SIZE, "%d\n",
 				sd_settings->aggressiveness);
@@ -1025,17 +1037,7 @@ static ssize_t nvsd_settings_store(struct kobject *kobj,
 
 	if (sd_settings) {
 		if (IS_NVSD_ATTR(enable)) {
-			if (sd_settings->phase_in_settings) {
-				err = strict_strtol(buf, 10, &result);
-				if (err)
-					return err;
-
-				if (nvsd_update_enable(sd_settings, result))
-					nvsd_check_and_update(1, 1, enable);
-
-			} else {
 				nvsd_check_and_update(0, 1, enable);
-			}
 		} else if (IS_NVSD_ATTR(aggressiveness)) {
 			err = strict_strtol(buf, 10, &result);
 			if (err)
@@ -1045,6 +1047,10 @@ static ssize_t nvsd_settings_store(struct kobject *kobj,
 					&& !sd_settings->phase_in_settings)
 				settings_updated = true;
 
+		} else if (IS_NVSD_ATTR(turn_off_brightness)) {
+			nvsd_check_and_update(0, 255, turn_off_brightness);
+		} else if (IS_NVSD_ATTR(turn_on_brightness)) {
+			nvsd_check_and_update(0, 255, turn_on_brightness);
 		} else if (IS_NVSD_ATTR(phase_in_settings)) {
 			nvsd_check_and_update(0, 1, phase_in_settings);
 		} else if (IS_NVSD_ATTR(phase_in_adjustments)) {
@@ -1137,7 +1143,7 @@ static ssize_t nvsd_settings_store(struct kobject *kobj,
 			mutex_unlock(&dc->lock);
 
 			/* Update backlight state IFF we're disabling! */
-			if (!sd_settings->enable && sd_settings->bl_device) {
+			if (!nvsd_is_enabled(sd_settings) && sd_settings->bl_device) {
 				/* Do the actual brightness update outside of
 				 * the mutex */
 				struct backlight_device *bl =
@@ -1187,7 +1193,6 @@ static ssize_t nvsd_registers_show(struct kobject *kobj,
 
 	tegra_dc_get(dc);
 
-	mutex_unlock(&dc->lock);
 	NVSD_PRINT_REG(DC_DISP_SD_CONTROL);
 	NVSD_PRINT_REG(DC_DISP_SD_CSC_COEFF);
 	NVSD_PRINT_REG_ARRAY(DC_DISP_SD_LUT);
@@ -1232,6 +1237,7 @@ int nvsd_create_sysfs(struct device *dev)
 
 	return retval;
 }
+EXPORT_SYMBOL(nvsd_create_sysfs);
 
 /* Sysfs destructor */
 void nvsd_remove_sysfs(struct device *dev)
@@ -1241,3 +1247,47 @@ void nvsd_remove_sysfs(struct device *dev)
 		kobject_put(nvsd_kobj);
 	}
 }
+EXPORT_SYMBOL(nvsd_remove_sysfs);
+
+static int nvsd_is_enabled(struct tegra_dc_sd_settings *settings)
+{
+	return (settings->enable && settings->enable_int);
+}
+
+/*wrapper function used for disabling/enabling prism*/
+void nvsd_enbl_dsbl_prism(struct device *dev, bool status)
+{
+	bool last_status;
+	struct tegra_dc_sd_settings *settings;
+	struct platform_device *ndev = to_platform_device(dev);
+	struct tegra_dc *dc = platform_get_drvdata(ndev);
+	if (!dc || !dc->enabled)
+		return;
+
+	settings = dc->out->sd_settings;
+	if (!settings)
+		return;
+
+	last_status = nvsd_is_enabled(settings);
+	settings->enable_int = status;
+	if (nvsd_is_enabled(settings) == last_status)
+		return;
+
+	nvsd_init(dc, settings);
+
+	return;
+}
+EXPORT_SYMBOL(nvsd_enbl_dsbl_prism);
+
+/* wrapper to enable/disable prism based on brightness */
+void nvsd_check_prism_thresh(struct device *dev, int brightness)
+{
+	struct tegra_dc *dc = dev_get_drvdata(dev);
+	struct tegra_dc_sd_settings *settings = dc->out->sd_settings;
+
+	if (brightness <= settings->turn_off_brightness)
+		nvsd_enbl_dsbl_prism(dev, false);
+	else if (brightness > settings->turn_on_brightness)
+		nvsd_enbl_dsbl_prism(dev, true);
+}
+EXPORT_SYMBOL(nvsd_check_prism_thresh);

@@ -1,7 +1,7 @@
 /*
  * arch/arm/mach-tegra/include/mach/tegra_usb_phy.h
  *
- * Copyright (c) 2012-2014, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2012-2015, NVIDIA CORPORATION.  All rights reserved.
  *
  * This software is licensed under the terms of the GNU General Public
  * License version 2, as published by the Free Software Foundation, and
@@ -75,6 +75,7 @@ struct tegra_usb_phy_ops {
 	bool (*apple_charger_2000ma_detect)(struct tegra_usb_phy *phy);
 	bool (*apple_charger_500ma_detect)(struct tegra_usb_phy *phy);
 	void (*pmc_disable) (struct tegra_usb_phy *phy);
+	bool (*is_pmc_wakeup)(struct tegra_usb_phy *phy);
 };
 
 /**
@@ -98,6 +99,9 @@ struct tegra_usb_phy {
 	struct tegra_usb_phy_ops *ops;
 	struct tegra_xtal_freq *freq;
 	struct usb_phy *ulpi_vp;
+#ifdef CONFIG_ARCH_TEGRA_21x_SOC
+	struct tegra_prod_list *prod_list;
+#endif
 	enum usb_phy_port_speed port_speed;
 	signed char utmi_xcvr_setup;
 	void __iomem *regs;

@@ -1,6 +1,7 @@
 /* -----------------------------------------------------------------------------
  * Copyright (c) 2011 Ozmo Inc
  * Released under the GNU General Public License Version 2 (GPLv2).
+ * Copyright (c) 2015, NVIDIA CORPORATION. All rights reserved.
  * -----------------------------------------------------------------------------
  */
 #include <linux/init.h>
@@ -51,6 +52,7 @@ static LIST_HEAD(g_pd_list);
 static LIST_HEAD(g_binding);
 static DEFINE_SPINLOCK(g_binding_lock);
 static struct sk_buff_head g_rx_queue;
+struct completion oz_pd_done;
 static u8 g_session_id;
 static u16 g_apps = 0x1;
 static int g_processing_rx;
@@ -89,7 +91,6 @@ static void oz_send_conn_rsp(struct oz_pd *pd, u8 status)
 	body = (struct oz_elt_connect_rsp *)(elt+1);
 	skb->dev = dev;
 	skb->protocol = htons(OZ_ETHERTYPE);
-	skb->priority = AC_VO;
 	/* Fill in device header */
 	if (dev_hard_header(skb, dev, OZ_ETHERTYPE, pd->mac_addr,
 			dev->dev_addr, skb->len) < 0) {
@@ -108,6 +109,11 @@ static void oz_send_conn_rsp(struct oz_pd *pd, u8 status)
 		body->session_id = pd->session_id;
 		put_unaligned(cpu_to_le16(pd->total_apps), &body->apps);
 	}
+	if (!netif_running(dev)) {
+		kfree_skb(skb);
+		return;
+	}
+
 	oz_trace_skb(skb, 'T');
 	dev_queue_xmit(skb);
 	return;
@@ -207,6 +213,8 @@ static struct oz_pd *oz_connect_req(struct oz_pd *cur_pd, struct oz_elt *elt,
 		if (!pd->ms_per_isoc)
 			pd->ms_per_isoc = 4;
 
+		pd->ms_isoc_latency = body->ms_isoc_latency;
+
 		switch (body->ms_isoc_latency & OZ_LATENCY_MASK) {
 		case OZ_ONE_MS_LATENCY:
 			pd->isoc_latency = (body->ms_isoc_latency &
@@ -264,8 +272,11 @@ done:
 		if (resume_apps)
 			if (oz_services_start(pd, resume_apps, 1))
 				rsp_status = OZ_STATUS_TOO_MANY_PDS;
-		if (stop_apps)
+		if (stop_apps) {
+			spin_lock_bh(&g_polling_lock);
 			oz_services_stop(pd, stop_apps, 0);
+			spin_unlock_bh(&g_polling_lock);
+		}
 		oz_pd_request_heartbeat(pd);
 	} else {
 		spin_unlock_bh(&g_polling_lock);
@@ -450,6 +461,9 @@ static int oz_net_notifier(struct notifier_block *nb, unsigned long event,
 		oz_trace_msg(M, "%s: event %s\n", __func__,
 			(event == NETDEV_UNREGISTER) ?
 			"NETDEV_UNREGISTER" : "NETDEV_DOWN");
+		pr_info("%s: event %s\n", __func__,
+			(event == NETDEV_UNREGISTER) ?
+			"NETDEV_UNREGISTER" : "NETDEV_DOWN");
 		oz_binding_remove(dev->name);
 		break;
 	}
@@ -492,6 +506,7 @@ void oz_protocol_term(void)
 			list_first_entry(&g_pd_list, struct oz_pd, link);
 		oz_pd_get(pd);
 		spin_unlock_bh(&g_polling_lock);
+		pr_info("%s: Protocol stop requested\n", __func__);
 		oz_pd_stop(pd);
 		oz_pd_put(pd);
 		spin_lock_bh(&g_polling_lock);
@@ -529,11 +544,12 @@ void oz_pd_timeout_handler(unsigned long data)
 	spin_unlock_bh(&g_polling_lock);
 	switch (type) {
 	case OZ_TIMER_TOUT:
-		oz_trace_msg(M, "OZ_TIMER_TOUT:\n");
+		oz_trace_msg(D, "OZ_TIMER_TOUT:\n");
 		oz_pd_sleep(pd);
 		break;
 	case OZ_TIMER_STOP:
-		oz_trace_msg(M, "OZ_TIMER_STOP:\n");
+		pr_info("%s: timeout happend.\n", __func__);
+		oz_trace_msg(D, "OZ_TIMER_STOP:\n");
 		oz_pd_stop(pd);
 		break;
 	}
@@ -662,6 +678,14 @@ static int oz_pkt_recv(struct sk_buff *skb, struct net_device *dev,
 	skb = skb_share_check(skb, GFP_ATOMIC);
 	if (skb == NULL)
 		return 0;
+
+	if (unlikely(!dev || !netif_running(dev))) {
+		oz_trace_msg(M, "%s: netdev stopped, drop pkt\n", __func__);
+		kfree_skb(skb);
+		g_processing_rx = 0;
+		return 0;
+	}
+
 	spin_lock_bh(&g_rx_queue.lock);
 	if (g_processing_rx) {
 		/* We already hold the lock so use __ variant.
@@ -673,6 +697,13 @@ static int oz_pkt_recv(struct sk_buff *skb, struct net_device *dev,
 		do {
 
 			spin_unlock_bh(&g_rx_queue.lock);
+			if (unlikely(!dev || !netif_running(dev))) {
+				kfree_skb(skb);
+				skb_queue_purge(&g_rx_queue);
+				g_processing_rx = 0;
+				return 0;
+			}
+
 			oz_rx_frame(skb);
 			spin_lock_bh(&g_rx_queue.lock);
 			if (skb_queue_empty(&g_rx_queue)) {
@@ -754,9 +785,14 @@ static void pd_stop_all_for_device(struct net_device *net_dev)
 	}
 	spin_unlock_bh(&g_polling_lock);
 	while (!list_empty(&h)) {
+		INIT_COMPLETION(oz_pd_done);
 		pd = list_first_entry(&h, struct oz_pd, link);
 		oz_pd_stop(pd);
 		oz_pd_put(pd);
+		/* wait for PD to get destroyed */
+		if (pd)
+			wait_for_completion_timeout(&oz_pd_done,
+						msecs_to_jiffies(50));
 	}
 }
 /*------------------------------------------------------------------------------
@@ -768,6 +804,7 @@ void oz_binding_remove(const char *net_dev)
 	int found = 0;
 
 	oz_trace_msg(M, "Removing binding: '%s'\n", net_dev);
+	pr_info("%s: Remove binding: '%s'\n", __func__, net_dev);
 	spin_lock_bh(&g_binding_lock);
 	list_for_each_entry_safe(binding, tmp, &g_binding, link) {
 		if (compare_binding_name(binding->name, net_dev)) {
@@ -779,14 +816,20 @@ void oz_binding_remove(const char *net_dev)
 	}
 	spin_unlock_bh(&g_binding_lock);
 	if (found) {
+		pd_stop_all_for_device(binding->ptype.dev);
+
+		/* purge pending rx skb */
+		skb_queue_purge(&g_rx_queue);
+		WARN_ON(!skb_queue_empty(&g_rx_queue));
+
 		dev_remove_pack(&binding->ptype);
 		if (binding->ptype.dev) {
 			oz_trace_msg(M, "%s: dev_put(%s)\n", __func__,
 							binding->name);
 			dev_put(binding->ptype.dev);
-			pd_stop_all_for_device(binding->ptype.dev);
 		}
 		kfree(binding);
+		g_processing_rx = 0;
 	}
 }
 /*------------------------------------------------------------------------------
@@ -821,12 +864,44 @@ static char *oz_get_next_device_name(char *s, char *dname, int max_size)
 	*dname = 0;
 	return s;
 }
+
+int oz_get_latency(void)
+{
+	int latency = 0;
+	struct oz_pd *pd;
+	struct list_head *e;
+
+	spin_lock_bh(&g_polling_lock);
+	if (list_empty(&g_pd_list)) {
+		spin_unlock_bh(&g_polling_lock);
+		return -ENODEV;
+	}
+	e = g_pd_list.next;
+	pd = container_of(e, struct oz_pd, link);
+
+	switch (pd->ms_isoc_latency & OZ_LATENCY_MASK) {
+	case OZ_ONE_MS_LATENCY:
+		latency = (pd->ms_isoc_latency & ~OZ_LATENCY_MASK);
+		break;
+	case OZ_TEN_MS_LATENCY:
+		latency = ((pd->ms_isoc_latency & ~OZ_LATENCY_MASK) * 10);
+		break;
+	default:
+		latency = pd->isoc_latency * pd->ms_per_isoc;
+	}
+
+	spin_unlock_bh(&g_polling_lock);
+
+	return latency;
+}
+
 /*------------------------------------------------------------------------------
  * Context: process
  */
 int oz_protocol_init(char *devs)
 {
 	skb_queue_head_init(&g_rx_queue);
+	init_completion(&oz_pd_done);
 	if (devs && (devs[0] == '*')) {
 		return -1;
 	} else {

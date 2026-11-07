@@ -23,9 +23,6 @@
 #include <linux/module.h>
 #include <linux/debugfs.h>
 #include <linux/clk/tegra.h>
-#include <mach/thermal.h>
-
-#include "dev.h"
 
 #include "gk20a.h"
 #include "hw_trim_gk20a.h"
@@ -35,27 +32,22 @@
 	gk20a_dbg(gpu_dbg_clk, fmt, ##arg)
 
 /* from vbios PLL info table */
-struct pll_parms gpc_pll_params = {
-	144, 2064,	/* freq */
-	1000, 2064,	/* vco */
-	12, 38,		/* u */
-	1, 255,		/* M */
-	8, 255,		/* N */
-	1, 32,		/* PL */
+static struct pll_parms gpc_pll_params = {
+	144000, 2064000,	/* freq */
+	1000000, 2064000,	/* vco */
+	12000, 38000,		/* u */
+	1, 255,			/* M */
+	8, 255,			/* N */
+	1, 32,			/* PL */
+	0, 0, 0, 0, 0,		/* NA mode parameters: not supported on GK20A */
+	500,			/* Locking and ramping timeout */
+	0,			/* NA mode lock delay: not supported on GK20A */
+	2,			/* IDDQ mode exit delay */
 };
 
-static int num_gpu_cooling_freq;
-static struct gpufreq_table_data *gpu_cooling_freq;
-
-struct gpufreq_table_data *tegra_gpufreq_table_get(void)
-{
-	return gpu_cooling_freq;
-}
-
-unsigned int tegra_gpufreq_table_size_get(void)
-{
-	return num_gpu_cooling_freq;
-}
+#ifdef CONFIG_DEBUG_FS
+static int clk_gk20a_debugfs_init(struct gk20a *g);
+#endif
 
 static u8 pl_to_div[] = {
 /* PL:   0, 1, 2, 3, 4, 5, 6,  7,  8,  9, 10, 11, 12, 13, 14 */
@@ -197,7 +189,7 @@ static int clk_slide_gpc_pll(struct gk20a *g, u32 n)
 {
 	u32 data, coeff;
 	u32 nold;
-	int ramp_timeout = 500;
+	int ramp_timeout = gpc_pll_params.lock_timeout;
 
 	/* get old coefficients */
 	coeff = gk20a_readl(g, trim_sys_gpcpll_coeff_r());
@@ -266,28 +258,6 @@ static int clk_slide_gpc_pll(struct gk20a *g, u32 n)
 	return 0;
 }
 
-#define DUMP_REG(addr_func) \
-do {									\
-	addr = trim_sys_##addr_func##_r();				\
-	data = gk20a_readl(g, addr);					\
-	pr_info(#addr_func "[0x%x] = 0x%x\n", addr, data);		\
-} while (0)
-
-static void dump_gpc_pll(struct gk20a *g, struct clk_gk20a *clk, u32 last_cfg)
-{
-	u32 addr, data;
-
-	pr_info("**** GPCPLL DUMP ****");
-	pr_info("gpcpll s/w M=%u N=%u P=%u freq=%u\n",
-		clk->gpc_pll.M, clk->gpc_pll.N, clk->gpc_pll.PL, clk->gpc_pll.freq);
-	pr_info("gpcpll_cfg_last = 0x%x\n", last_cfg);
-	DUMP_REG(gpcpll_cfg);
-	DUMP_REG(gpcpll_coeff);
-	DUMP_REG(sel_vco);
-	DUMP_REG(gpc2clk_out);
-	pr_info("\n");
-}
-
 static int clk_program_gpc_pll(struct gk20a *g, struct clk_gk20a *clk,
 			int allow_slide)
 {
@@ -341,7 +311,7 @@ static int clk_program_gpc_pll(struct gk20a *g, struct clk_gk20a *clk,
 				trim_sys_gpcpll_cfg_iddq_power_on_v());
 		gk20a_writel(g, trim_sys_gpcpll_cfg_r(), cfg);
 		gk20a_readl(g, trim_sys_gpcpll_cfg_r());
-		udelay(2);
+		udelay(gpc_pll_params.iddq_exit_delay);
 	}
 
 	/* disable PLL before changing coefficients */
@@ -375,7 +345,7 @@ static int clk_program_gpc_pll(struct gk20a *g, struct clk_gk20a *clk,
 	}
 
 	/* wait pll lock */
-	timeout = clk->pll_delay / 2 + 1;
+	timeout = gpc_pll_params.lock_timeout / 2 + 1;
 	do {
 		cfg = gk20a_readl(g, trim_sys_gpcpll_cfg_r());
 		if (cfg & trim_sys_gpcpll_cfg_pll_lock_true_f())
@@ -384,7 +354,6 @@ static int clk_program_gpc_pll(struct gk20a *g, struct clk_gk20a *clk,
 	} while (--timeout > 0);
 
 	/* PLL is messed up. What can we do here? */
-	dump_gpc_pll(g, clk, cfg);
 	BUG();
 	return -EBUSY;
 
@@ -449,11 +418,15 @@ struct clk *gk20a_clk_get(struct gk20a *g)
 {
 	if (!g->clk.tegra_clk) {
 		struct clk *clk;
+		char clk_dev_id[32];
+		struct device *dev = dev_from_gk20a(g);
 
-		clk = clk_get_sys("tegra_gk20a", "gpu");
+		snprintf(clk_dev_id, 32, "tegra_%s", dev_name(dev));
+
+		clk = clk_get_sys(clk_dev_id, "gpu");
 		if (IS_ERR(clk)) {
-			gk20a_err(dev_from_gk20a(g),
-				"fail to get tegra gpu clk tegra_gk20a/gpu");
+			gk20a_err(dev, "fail to get tegra gpu clk %s/gpu\n",
+				  clk_dev_id);
 			return NULL;
 		}
 		g->clk.tegra_clk = clk;
@@ -466,8 +439,6 @@ static int gk20a_init_clk_setup_sw(struct gk20a *g)
 {
 	struct clk_gk20a *clk = &g->clk;
 	static int initialized;
-	unsigned long *freqs;
-	int err, num_freqs;
 	struct clk *ref;
 	unsigned long ref_rate;
 
@@ -489,10 +460,8 @@ static int gk20a_init_clk_setup_sw(struct gk20a *g)
 	}
 	ref_rate = clk_get_rate(ref);
 
-	clk->pll_delay = 300; /* usec */
-
 	clk->gpc_pll.id = GK20A_GPC_PLL;
-	clk->gpc_pll.clk_in = ref_rate / 1000000; /* MHz */
+	clk->gpc_pll.clk_in = ref_rate / KHZ;
 
 	/* Decide initial frequency */
 	if (!initialized) {
@@ -503,32 +472,6 @@ static int gk20a_init_clk_setup_sw(struct gk20a *g)
 		clk->gpc_pll.PL = 1;
 		clk->gpc_pll.freq = clk->gpc_pll.clk_in * clk->gpc_pll.N;
 		clk->gpc_pll.freq /= pl_to_div[clk->gpc_pll.PL];
-	}
-
-	err = tegra_dvfs_get_freqs(clk_get_parent(clk->tegra_clk),
-				   &freqs, &num_freqs);
-	if (!err) {
-		int i, j;
-
-		/* init j for inverse traversal of frequencies */
-		j = num_freqs - 1;
-
-		gpu_cooling_freq = kzalloc(
-				(1 + num_freqs) * sizeof(*gpu_cooling_freq),
-				GFP_KERNEL);
-
-		/* store frequencies in inverse order */
-		for (i = 0; i < num_freqs; ++i, --j) {
-			gpu_cooling_freq[i].index = i;
-			gpu_cooling_freq[i].frequency = freqs[j];
-		}
-
-		/* add 'end of table' marker */
-		gpu_cooling_freq[i].index = i;
-		gpu_cooling_freq[i].frequency = GPUFREQ_TABLE_END;
-
-		/* store number of frequencies */
-		num_gpu_cooling_freq = num_freqs + 1;
 	}
 
 	mutex_init(&clk->clk_mutex);
@@ -686,7 +629,18 @@ static int gk20a_clk_register_export_ops(struct gk20a *g)
 	return ret;
 }
 
-int gk20a_init_clk_support(struct gk20a *g)
+static void gk20a_clk_disable_slowboot(struct gk20a *g)
+{
+	u32 data;
+
+	data = gk20a_readl(g, trim_sys_gpc2clk_out_r());
+	data = set_field(data,
+			trim_sys_gpc2clk_out_bypdiv_m(),
+			trim_sys_gpc2clk_out_bypdiv_f(0));
+	gk20a_writel(g, trim_sys_gpc2clk_out_r(), data);
+}
+
+static int gk20a_init_clk_support(struct gk20a *g)
 {
 	struct clk_gk20a *clk = &g->clk;
 	u32 err;
@@ -727,7 +681,34 @@ int gk20a_init_clk_support(struct gk20a *g)
 	if (err)
 		return err;
 
+#ifdef CONFIG_DEBUG_FS
+	if (!clk->debugfs_set) {
+		if (!clk_gk20a_debugfs_init(g))
+			clk->debugfs_set = true;
+	}
+#endif
 	return err;
+}
+
+static int gk20a_suspend_clk_support(struct gk20a *g)
+{
+	int ret;
+
+	clk_disable(g->clk.tegra_clk);
+
+	/* The prev call may not disable PLL if gbus is unbalanced - force it */
+	mutex_lock(&g->clk.clk_mutex);
+	ret = clk_disable_gpcpll(g, 1);
+	g->clk.clk_hw_on = false;
+	mutex_unlock(&g->clk.clk_mutex);
+	return ret;
+}
+
+void gk20a_init_clk_ops(struct gpu_ops *gops)
+{
+	gops->clk.disable_slowboot = gk20a_clk_disable_slowboot;
+	gops->clk.init_clk_support = gk20a_init_clk_support;
+	gops->clk.suspend_clk_support = gk20a_suspend_clk_support;
 }
 
 unsigned long gk20a_clk_get_rate(struct gk20a *g)
@@ -748,20 +729,6 @@ long gk20a_clk_round_rate(struct gk20a *g, unsigned long rate)
 int gk20a_clk_set_rate(struct gk20a *g, unsigned long rate)
 {
 	return clk_set_rate(g->clk.tegra_clk, rate);
-}
-
-int gk20a_suspend_clk_support(struct gk20a *g)
-{
-	int ret;
-
-	clk_disable(g->clk.tegra_clk);
-
-	/* The prev call may not disable PLL if gbus is unbalanced - force it */
-	mutex_lock(&g->clk.clk_mutex);
-	ret = clk_disable_gpcpll(g, 1);
-	g->clk.clk_hw_on = false;
-	mutex_unlock(&g->clk.clk_mutex);
-	return ret;
 }
 
 #ifdef CONFIG_DEBUG_FS
@@ -802,7 +769,7 @@ static int pll_reg_show(struct seq_file *s, void *data)
 	pl = trim_sys_gpcpll_coeff_pldiv_v(reg);
 	f = g->clk.gpc_pll.clk_in * n / (m * pl_to_div[pl]);
 	seq_printf(s, "coef = 0x%x : m = %u : n = %u : pl = %u", reg, m, n, pl);
-	seq_printf(s, " : pll_f(gpu_f) = %u(%u) MHz\n", f, f/2);
+	seq_printf(s, " : pll_f(gpu_f) = %u(%u) kHz\n", f, f/2);
 	mutex_unlock(&g->clk.clk_mutex);
 	return 0;
 }
@@ -826,7 +793,7 @@ static int monitor_get(void *data, u64 *val)
 	int err;
 
 	u32 ncycle = 100; /* count GPCCLK for ncycle of clkin */
-	u32 clkin = clk->gpc_pll.clk_in;
+	u64 freq = clk->gpc_pll.clk_in;
 	u32 count1, count2;
 
 	err = gk20a_busy(g->dev);
@@ -849,7 +816,10 @@ static int monitor_get(void *data, u64 *val)
 	count1 = gk20a_readl(g, trim_gpc_clk_cntr_ncgpcclk_cnt_r(0));
 	udelay(100);
 	count2 = gk20a_readl(g, trim_gpc_clk_cntr_ncgpcclk_cnt_r(0));
-	*val = (u64)(trim_gpc_clk_cntr_ncgpcclk_cnt_value_v(count2) * clkin / ncycle);
+	freq *= trim_gpc_clk_cntr_ncgpcclk_cnt_value_v(count2);
+	do_div(freq, ncycle);
+	*val = freq;
+
 	gk20a_idle(g->dev);
 
 	if (count1 != count2)
@@ -858,11 +828,10 @@ static int monitor_get(void *data, u64 *val)
 }
 DEFINE_SIMPLE_ATTRIBUTE(monitor_fops, monitor_get, NULL, "%llu\n");
 
-int clk_gk20a_debugfs_init(struct platform_device *dev)
+static int clk_gk20a_debugfs_init(struct gk20a *g)
 {
 	struct dentry *d;
-	struct gk20a_platform *platform = platform_get_drvdata(dev);
-	struct gk20a *g = get_gk20a(dev);
+	struct gk20a_platform *platform = platform_get_drvdata(g->dev);
 
 	d = debugfs_create_file(
 		"rate", S_IRUGO|S_IWUSR, platform->debugfs, g, &rate_fops);

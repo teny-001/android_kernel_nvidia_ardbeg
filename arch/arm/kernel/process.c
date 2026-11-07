@@ -33,6 +33,7 @@
 #include <linux/cpuidle.h>
 #include <linux/leds.h>
 #include <linux/console.h>
+#include <linux/reboot.h>
 
 #include <asm/cacheflush.h>
 #include <asm/idmap.h>
@@ -40,6 +41,7 @@
 #include <asm/thread_notify.h>
 #include <asm/stacktrace.h>
 #include <asm/mach/time.h>
+#include <asm/tls.h>
 
 #ifdef CONFIG_CC_STACKPROTECTOR
 #include <linux/stackprotector.h>
@@ -150,17 +152,13 @@ void soft_restart(unsigned long addr)
 	BUG();
 }
 
-static void null_restart(char mode, const char *cmd)
-{
-}
-
 /*
  * Function pointers to optional machine specific functions
  */
 void (*pm_power_off)(void);
 EXPORT_SYMBOL(pm_power_off);
 
-void (*arm_pm_restart)(char str, const char *cmd) = null_restart;
+void (*arm_pm_restart)(enum reboot_mode reboot_mode, const char *cmd);
 EXPORT_SYMBOL_GPL(arm_pm_restart);
 
 void (*pm_power_reset)(void);
@@ -217,16 +215,6 @@ void arch_cpu_idle(void)
 		default_idle();
 }
 
-static char reboot_mode = 'h';
-
-int __init reboot_setup(char *str)
-{
-	reboot_mode = str[0];
-	return 1;
-}
-
-__setup("reboot=", reboot_setup);
-
 /*
  * Called by kexec, immediately prior to machine_kexec().
  *
@@ -258,6 +246,7 @@ void machine_shutdown(void)
  */
 void machine_halt(void)
 {
+	preempt_disable();
 	smp_send_stop();
 
 	local_irq_disable();
@@ -301,9 +290,13 @@ void machine_restart(char *cmd)
 	local_irq_disable();
 	local_fiq_disable();
 
+	preempt_disable();
 	smp_send_stop();
 
-	arm_pm_restart(reboot_mode, cmd);
+	if (arm_pm_restart)
+		arm_pm_restart(reboot_mode, cmd);
+	else
+		do_kernel_restart(cmd);
 
 	/* Give a grace period for failure to restart of 1s */
 	mdelay(1000);
@@ -510,7 +503,8 @@ copy_thread(unsigned long clone_flags, unsigned long stack_start,
 	clear_ptrace_hw_breakpoint(p);
 
 	if (clone_flags & CLONE_SETTLS)
-		thread->tp_value = childregs->ARM_r3;
+		thread->tp_value[0] = childregs->ARM_r3;
+	thread->tp_value[1] = get_tpuser();
 
 	thread_notify(THREAD_NOTIFY_COPY, thread);
 
@@ -612,14 +606,21 @@ int in_gate_area_no_mm(unsigned long addr)
 
 const char *arch_vma_name(struct vm_area_struct *vma)
 {
-	return is_gate_vma(vma) ? "[vectors]" :
-		(vma->vm_mm && vma->vm_start == vma->vm_mm->context.sigpage) ?
-		 "[sigpage]" : NULL;
+	if (is_gate_vma(vma))
+		return "[vectors]";
+	if (!vma->vm_mm)
+		return NULL;
+	if (vma->vm_start == vma->vm_mm->context.sigpage)
+		return "[sigpage]";
+	if (vma->vm_start == (long)vma->vm_mm->context.vdso)
+		return "[vdso]";
+	return NULL;
 }
 
 static struct page *signal_page;
 extern struct page *get_signal_page(void);
-
+extern int vdso_setup_additional_pages(struct linux_binprm *bprm,
+				       int uses_interp);
 int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
 {
 	struct mm_struct *mm = current->mm;
@@ -642,8 +643,12 @@ int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
 		VM_READ | VM_EXEC | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC,
 		&signal_page);
 
-	if (ret == 0)
-		mm->context.sigpage = addr;
+	if (ret != 0)
+		goto up_fail;
+
+	mm->context.sigpage = addr;
+
+	ret = vdso_setup_additional_pages(bprm, uses_interp);
 
  up_fail:
 	up_write(&mm->mmap_sem);

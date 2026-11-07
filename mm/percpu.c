@@ -385,6 +385,8 @@ static int pcpu_extend_area_map(struct pcpu_chunk *chunk, int new_alloc)
 	size_t old_size = 0, new_size = new_alloc * sizeof(new[0]);
 	unsigned long flags;
 
+	lockdep_assert_held(&pcpu_alloc_mutex);
+
 	new = pcpu_mem_zalloc(new_size);
 	if (!new)
 		return -ENOMEM;
@@ -612,7 +614,7 @@ static struct pcpu_chunk *pcpu_alloc_chunk(void)
 	chunk->map = pcpu_mem_zalloc(PCPU_DFL_MAP_ALLOC *
 						sizeof(chunk->map[0]));
 	if (!chunk->map) {
-		kfree(chunk);
+		pcpu_mem_free(chunk, pcpu_chunk_struct_size);
 		return NULL;
 	}
 

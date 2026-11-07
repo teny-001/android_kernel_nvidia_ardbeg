@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2013, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2012-2016, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -106,6 +106,22 @@ static inline u32 pbdma_gp_put_r(u32 i)
 {
 	return 0x00040000 + i*8192;
 }
+static inline u32 pbdma_timeout_r(u32 i)
+{
+	return 0x0004012c + i*8192;
+}
+static inline u32 pbdma_timeout__size_1_v(void)
+{
+	return 0x00000001;
+}
+static inline u32 pbdma_timeout_period_m(void)
+{
+	return 0xffffffff << 0;
+}
+static inline u32 pbdma_timeout_period_max_f(void)
+{
+	return 0xffffffff;
+}
 static inline u32 pbdma_pb_fetch_r(u32 i)
 {
 	return 0x00040054 + i*8192;
@@ -174,6 +190,14 @@ static inline u32 pbdma_pb_header_type_inc_f(void)
 {
 	return 0x20000000;
 }
+static inline u32 pbdma_pb_header_type_non_inc_f(void)
+{
+	return 0x60000000;
+}
+static inline u32 pbdma_hdr_shadow_r(u32 i)
+{
+	return 0x00040118 + i*8192;
+}
 static inline u32 pbdma_subdevice_r(u32 i)
 {
 	return 0x00040094 + i*8192;
@@ -193,6 +217,38 @@ static inline u32 pbdma_subdevice_channel_dma_enable_f(void)
 static inline u32 pbdma_method0_r(u32 i)
 {
 	return 0x000400c0 + i*8192;
+}
+static inline u32 pbdma_method0_addr_f(u32 v)
+{
+	return (v & 0xfff) << 2;
+}
+static inline u32 pbdma_method0_addr_v(u32 r)
+{
+	return (r >> 2) & 0xfff;
+}
+static inline u32 pbdma_method0_subch_v(u32 r)
+{
+	return (r >> 16) & 0x7;
+}
+static inline u32 pbdma_method0_first_true_f(void)
+{
+	return 0x400000;
+}
+static inline u32 pbdma_method0_valid_true_f(void)
+{
+	return 0x80000000;
+}
+static inline u32 pbdma_method1_r(u32 i)
+{
+	return 0x000400c8 + i*8192;
+}
+static inline u32 pbdma_method2_r(u32 i)
+{
+	return 0x000400d0 + i*8192;
+}
+static inline u32 pbdma_method3_r(u32 i)
+{
+	return 0x000400d8 + i*8192;
 }
 static inline u32 pbdma_data0_r(u32 i)
 {
@@ -218,13 +274,33 @@ static inline u32 pbdma_acquire_retry_exp_2_f(void)
 {
 	return 0x100;
 }
+static inline u32 pbdma_acquire_timeout_exp_f(u32 v)
+{
+	return (v & 0xf) << 11;
+}
+static inline u32 pbdma_acquire_timeout_exp_max_v(void)
+{
+	return 0x0000000f;
+}
 static inline u32 pbdma_acquire_timeout_exp_max_f(void)
 {
 	return 0x7800;
 }
+static inline u32 pbdma_acquire_timeout_man_f(u32 v)
+{
+	return (v & 0xffff) << 15;
+}
+static inline u32 pbdma_acquire_timeout_man_max_v(void)
+{
+	return 0x0000ffff;
+}
 static inline u32 pbdma_acquire_timeout_man_max_f(void)
 {
 	return 0x7fff8000;
+}
+static inline u32 pbdma_acquire_timeout_en_enable_f(void)
+{
+	return 0x80000000;
 }
 static inline u32 pbdma_acquire_timeout_en_disable_f(void)
 {
@@ -433,5 +509,37 @@ static inline u32 pbdma_intr_stall_lbreq_enabled_f(void)
 static inline u32 pbdma_udma_nop_r(void)
 {
 	return 0x00000008;
+}
+static inline u32 pbdma_syncpointa_r(u32 i)
+{
+	return 0x000400a4 + i*8192;
+}
+static inline u32 pbdma_syncpointa_payload_v(u32 r)
+{
+	return (r >> 0) & 0xffffffff;
+}
+static inline u32 pbdma_syncpointb_r(u32 i)
+{
+	return 0x000400a8 + i*8192;
+}
+static inline u32 pbdma_syncpointb_op_v(u32 r)
+{
+	return (r >> 0) & 0x3;
+}
+static inline u32 pbdma_syncpointb_op_wait_v(void)
+{
+	return 0x00000000;
+}
+static inline u32 pbdma_syncpointb_wait_switch_v(u32 r)
+{
+	return (r >> 4) & 0x1;
+}
+static inline u32 pbdma_syncpointb_wait_switch_en_v(void)
+{
+	return 0x00000001;
+}
+static inline u32 pbdma_syncpointb_syncpt_index_v(u32 r)
+{
+	return (r >> 8) & 0xff;
 }
 #endif

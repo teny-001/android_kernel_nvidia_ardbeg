@@ -3,7 +3,7 @@
  *
  * Handle allocation and freeing routines for nvmap
  *
- * Copyright (c) 2009-2014, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2009-2015, NVIDIA CORPORATION. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -23,6 +23,7 @@
 #define pr_fmt(fmt)	"%s: " fmt, __func__
 
 #include <linux/err.h>
+#include <linux/io.h>
 #include <linux/kernel.h>
 #include <linux/list.h>
 #include <linux/mm.h>
@@ -38,450 +39,6 @@
 
 #include "nvmap_priv.h"
 #include "nvmap_ioctl.h"
-
-static bool zero_memory;
-module_param(zero_memory, bool, 0644);
-u32 nvmap_max_handle_count;
-
-#define NVMAP_SECURE_HEAPS	(NVMAP_HEAP_CARVEOUT_IRAM | NVMAP_HEAP_IOVMM | \
-				 NVMAP_HEAP_CARVEOUT_VPR)
-
-/* handles may be arbitrarily large (16+MiB), and any handle allocated from
- * the kernel (i.e., not a carveout handle) includes its array of pages. to
- * preserve kmalloc space, if the array of pages exceeds PAGELIST_VMALLOC_MIN,
- * the array is allocated using vmalloc. */
-#define PAGELIST_VMALLOC_MIN	(PAGE_SIZE)
-
-void *nvmap_altalloc(size_t len)
-{
-	if (len > PAGELIST_VMALLOC_MIN)
-		return vmalloc(len);
-	else
-		return kmalloc(len, GFP_KERNEL);
-}
-
-void nvmap_altfree(void *ptr, size_t len)
-{
-	if (!ptr)
-		return;
-
-	if (len > PAGELIST_VMALLOC_MIN)
-		vfree(ptr);
-	else
-		kfree(ptr);
-}
-
-void _nvmap_handle_free(struct nvmap_handle *h)
-{
-	unsigned int i, nr_page, page_index = 0;
-#ifdef CONFIG_NVMAP_PAGE_POOLS
-	struct nvmap_page_pool *pool = NULL;
-#endif
-
-	if (h->nvhost_priv)
-		h->nvhost_priv_delete(h->nvhost_priv);
-
-	if (nvmap_handle_remove(h->dev, h) != 0)
-		return;
-
-	if (!h->alloc)
-		goto out;
-
-	nvmap_stats_inc(NS_RELEASE, h->size);
-	nvmap_stats_dec(NS_TOTAL, PAGE_ALIGN(h->orig_size));
-	if (!h->heap_pgalloc) {
-		nvmap_heap_free(h->carveout);
-		goto out;
-	}
-
-	nr_page = DIV_ROUND_UP(h->size, PAGE_SIZE);
-
-	BUG_ON(h->size & ~PAGE_MASK);
-	BUG_ON(!h->pgalloc.pages);
-
-#ifdef NVMAP_LAZY_VFREE
-	if (h->vaddr)
-		vm_unmap_ram(h->vaddr, h->size >> PAGE_SHIFT);
-#endif
-
-	for (i = 0; i < nr_page; i++)
-		h->pgalloc.pages[i] = nvmap_to_page(h->pgalloc.pages[i]);
-
-#ifdef CONFIG_NVMAP_PAGE_POOLS
-	pool = &nvmap_dev->pool;
-
-	while (page_index < nr_page) {
-		if (!nvmap_page_pool_fill(pool,
-			h->pgalloc.pages[page_index]))
-			break;
-
-		page_index++;
-	}
-
-#endif
-
-	for (i = page_index; i < nr_page; i++)
-		__free_page(h->pgalloc.pages[i]);
-
-	nvmap_altfree(h->pgalloc.pages, nr_page * sizeof(struct page *));
-
-out:
-	kfree(h);
-}
-
-static struct page *nvmap_alloc_pages_exact(gfp_t gfp, size_t size)
-{
-	struct page *page, *p, *e;
-	unsigned int order;
-
-	size = PAGE_ALIGN(size);
-	order = get_order(size);
-	page = alloc_pages(gfp, order);
-
-	if (!page)
-		return NULL;
-
-	split_page(page, order);
-	e = page + (1 << order);
-	for (p = page + (size >> PAGE_SHIFT); p < e; p++)
-		__free_page(p);
-
-	return page;
-}
-
-static int handle_page_alloc(struct nvmap_client *client,
-			     struct nvmap_handle *h, bool contiguous)
-{
-	int err = 0;
-	size_t size = PAGE_ALIGN(h->size);
-	unsigned int nr_page = size >> PAGE_SHIFT;
-	pgprot_t prot;
-	unsigned int i = 0, page_index = 0;
-	struct page **pages;
-#ifdef CONFIG_NVMAP_PAGE_POOLS
-	struct nvmap_page_pool *pool = NULL;
-	phys_addr_t paddr;
-#endif
-	gfp_t gfp = GFP_NVMAP;
-	unsigned long kaddr;
-	pte_t **pte = NULL;
-
-	if (h->userflags & NVMAP_HANDLE_ZEROED_PAGES || zero_memory) {
-		gfp |= __GFP_ZERO;
-		prot = nvmap_pgprot(h, PG_PROT_KERNEL);
-		pte = nvmap_alloc_pte(nvmap_dev, (void **)&kaddr);
-		if (IS_ERR(pte))
-			return -ENOMEM;
-	}
-
-	pages = nvmap_altalloc(nr_page * sizeof(*pages));
-	if (!pages)
-		return -ENOMEM;
-
-	prot = nvmap_pgprot(h, PG_PROT_KERNEL);
-
-	if (contiguous) {
-		struct page *page;
-		page = nvmap_alloc_pages_exact(gfp, size);
-		if (!page)
-			goto fail;
-
-		for (i = 0; i < nr_page; i++)
-			pages[i] = nth_page(page, i);
-
-	} else {
-#ifdef CONFIG_NVMAP_PAGE_POOLS
-		pool = &nvmap_dev->pool;
-
-		for (i = 0; i < nr_page; i++) {
-			/* Get pages from pool, if available. */
-			pages[i] = nvmap_page_pool_alloc(pool);
-			if (!pages[i])
-				break;
-			if (h->userflags & NVMAP_HANDLE_ZEROED_PAGES ||
-			    zero_memory) {
-				/*
-				 * Just memset low mem pages; they will for
-				 * sure have a virtual address. Otherwise, build
-				 * a mapping for the page in the kernel.
-				 */
-				if (!PageHighMem(pages[i])) {
-					memset(page_address(pages[i]), 0,
-					       PAGE_SIZE);
-				} else {
-					paddr = page_to_phys(pages[i]);
-					set_pte_at(&init_mm, kaddr, *pte,
-						   pfn_pte(__phys_to_pfn(paddr),
-							   prot));
-					nvmap_flush_tlb_kernel_page(kaddr);
-					memset((char *)kaddr, 0, PAGE_SIZE);
-				}
-			}
-			page_index++;
-		}
-#endif
-		for (; i < nr_page; i++) {
-			pages[i] = nvmap_alloc_pages_exact(gfp,	PAGE_SIZE);
-			if (!pages[i])
-				goto fail;
-		}
-	}
-
-	/*
-	 * Make sure any data in the caches is flushed out before
-	 * passing these pages to userspace. otherwise, It can lead to
-	 * corruption in pages that get mapped as something other than WB in
-	 * userspace and leaked kernel data structures.
-	 */
-	nvmap_flush_cache(pages, nr_page);
-
-	if (err)
-		goto fail;
-
-	if (h->userflags & NVMAP_HANDLE_ZEROED_PAGES || zero_memory)
-		nvmap_free_pte(nvmap_dev, pte);
-	h->size = size;
-	h->pgalloc.pages = pages;
-	h->pgalloc.contig = contiguous;
-	INIT_LIST_HEAD(&h->pgalloc.vmas);
-	atomic_set(&h->pgalloc.ndirty, 0);
-	return 0;
-
-fail:
-	if (h->userflags & NVMAP_HANDLE_ZEROED_PAGES || zero_memory)
-		nvmap_free_pte(nvmap_dev, pte);
-	while (i--)
-		__free_page(pages[i]);
-	nvmap_altfree(pages, nr_page * sizeof(*pages));
-	wmb();
-	return -ENOMEM;
-}
-
-static void alloc_handle(struct nvmap_client *client,
-			 struct nvmap_handle *h, unsigned int type)
-{
-	unsigned int carveout_mask = NVMAP_HEAP_CARVEOUT_MASK;
-	unsigned int iovmm_mask = NVMAP_HEAP_IOVMM;
-
-	BUG_ON(type & (type - 1));
-
-#ifdef CONFIG_NVMAP_CONVERT_CARVEOUT_TO_IOVMM
-	/* Convert generic carveout requests to iovmm requests. */
-	carveout_mask &= ~NVMAP_HEAP_CARVEOUT_GENERIC;
-	iovmm_mask |= NVMAP_HEAP_CARVEOUT_GENERIC;
-#endif
-
-	if (type & carveout_mask) {
-		struct nvmap_heap_block *b;
-
-		b = nvmap_carveout_alloc(client, h, type);
-		if (b) {
-			h->heap_pgalloc = false;
-			/* barrier to ensure all handle alloc data
-			 * is visible before alloc is seen by other
-			 * processors.
-			 */
-			mb();
-			h->alloc = true;
-			nvmap_carveout_commit_add(client,
-				nvmap_heap_to_arg(nvmap_block_to_heap(b)),
-				h->size);
-		}
-	} else if (type & iovmm_mask) {
-		int ret;
-		size_t reserved = PAGE_ALIGN(h->size);
-
-		atomic_add(reserved, &client->iovm_commit);
-		ret = handle_page_alloc(client, h,
-			h->userflags & NVMAP_HANDLE_PHYS_CONTIG);
-		if (ret) {
-			atomic_sub(reserved, &client->iovm_commit);
-			return;
-		}
-		h->heap_pgalloc = true;
-		mb();
-		h->alloc = true;
-	}
-}
-
-/* small allocations will try to allocate from generic OS memory before
- * any of the limited heaps, to increase the effective memory for graphics
- * allocations, and to reduce fragmentation of the graphics heaps with
- * sub-page splinters */
-static const unsigned int heap_policy_small[] = {
-	NVMAP_HEAP_CARVEOUT_VPR,
-	NVMAP_HEAP_CARVEOUT_IRAM,
-	NVMAP_HEAP_CARVEOUT_MASK,
-	NVMAP_HEAP_IOVMM,
-	0,
-};
-
-static const unsigned int heap_policy_large[] = {
-	NVMAP_HEAP_CARVEOUT_VPR,
-	NVMAP_HEAP_CARVEOUT_IRAM,
-	NVMAP_HEAP_IOVMM,
-	NVMAP_HEAP_CARVEOUT_MASK,
-	0,
-};
-
-int nvmap_alloc_handle(struct nvmap_client *client,
-		       struct nvmap_handle *h, unsigned int heap_mask,
-		       size_t align,
-		       u8 kind,
-		       unsigned int flags)
-{
-	const unsigned int *alloc_policy;
-	int nr_page;
-	int err = -ENOMEM;
-
-	h = nvmap_handle_get(h);
-
-	if (!h)
-		return -EINVAL;
-
-	if (h->alloc) {
-		nvmap_handle_put(h);
-		return -EEXIST;
-	}
-
-	nvmap_stats_inc(NS_TOTAL, PAGE_ALIGN(h->orig_size));
-	nvmap_stats_inc(NS_ALLOC, PAGE_ALIGN(h->size));
-	trace_nvmap_alloc_handle(client, h,
-		h->size, heap_mask, align, flags,
-		nvmap_stats_read(NS_TOTAL),
-		nvmap_stats_read(NS_ALLOC));
-	h->userflags = flags;
-	nr_page = ((h->size + PAGE_SIZE - 1) >> PAGE_SHIFT);
-	h->secure = !!(flags & NVMAP_HANDLE_SECURE);
-	h->flags = (flags & NVMAP_HANDLE_CACHE_FLAG);
-	h->align = max_t(size_t, align, L1_CACHE_BYTES);
-	h->kind = kind;
-	h->map_resources = 0;
-
-#ifndef CONFIG_TEGRA_IOVMM
-	/* convert iovmm requests to generic carveout. */
-	if (heap_mask & NVMAP_HEAP_IOVMM) {
-		heap_mask = (heap_mask & ~NVMAP_HEAP_IOVMM) |
-			    NVMAP_HEAP_CARVEOUT_GENERIC;
-	}
-#endif
-	/* secure allocations can only be served from secure heaps */
-	if (h->secure)
-		heap_mask &= NVMAP_SECURE_HEAPS;
-
-	if (!heap_mask) {
-		err = -EINVAL;
-		goto out;
-	}
-
-	alloc_policy = (nr_page == 1) ? heap_policy_small : heap_policy_large;
-
-	while (!h->alloc && *alloc_policy) {
-		unsigned int heap_type;
-
-		heap_type = *alloc_policy++;
-		heap_type &= heap_mask;
-
-		if (!heap_type)
-			continue;
-
-		heap_mask &= ~heap_type;
-
-		while (heap_type && !h->alloc) {
-			unsigned int heap;
-
-			/* iterate possible heaps MSB-to-LSB, since higher-
-			 * priority carveouts will have higher usage masks */
-			heap = 1 << __fls(heap_type);
-			alloc_handle(client, h, heap);
-			heap_type &= ~heap;
-		}
-	}
-
-out:
-	if (h->alloc) {
-		if (client->kernel_client)
-			nvmap_stats_inc(NS_KALLOC, h->size);
-		else
-			nvmap_stats_inc(NS_UALLOC, h->size);
-	} else {
-		nvmap_stats_dec(NS_TOTAL, PAGE_ALIGN(h->orig_size));
-		nvmap_stats_dec(NS_ALLOC, PAGE_ALIGN(h->orig_size));
-	}
-
-	err = (h->alloc) ? 0 : err;
-	nvmap_handle_put(h);
-	return err;
-}
-
-void nvmap_free_handle(struct nvmap_client *client,
-		       struct nvmap_handle *handle)
-{
-	struct nvmap_handle_ref *ref;
-	struct nvmap_handle *h;
-	int pins;
-
-	nvmap_ref_lock(client);
-
-	ref = __nvmap_validate_locked(client, handle);
-	if (!ref) {
-		nvmap_ref_unlock(client);
-		return;
-	}
-
-	trace_nvmap_free_handle(client, handle);
-	BUG_ON(!ref->handle);
-	h = ref->handle;
-
-	if (atomic_dec_return(&ref->dupes)) {
-		nvmap_ref_unlock(client);
-		goto out;
-	}
-
-	smp_rmb();
-	pins = atomic_read(&ref->pin);
-	rb_erase(&ref->node, &client->handle_refs);
-	client->handle_count--;
-
-	if (h->alloc && h->heap_pgalloc && !h->pgalloc.contig)
-		atomic_sub_return(h->size, &client->iovm_commit);
-
-	if (h->alloc && !h->heap_pgalloc) {
-		mutex_lock(&h->lock);
-		nvmap_carveout_commit_subtract(client,
-			nvmap_heap_to_arg(nvmap_block_to_heap(h->carveout)),
-			h->size);
-		mutex_unlock(&h->lock);
-	}
-
-	nvmap_ref_unlock(client);
-
-	if (pins)
-		nvmap_debug(client, "%s freeing pinned handle %p\n",
-			    current->group_leader->comm, h);
-
-	while (atomic_read(&ref->pin))
-		__nvmap_unpin(ref);
-
-	if (h->owner == client) {
-		h->owner = NULL;
-		h->owner_ref = NULL;
-	}
-
-	dma_buf_put(ref->handle->dmabuf);
-	kfree(ref);
-
-out:
-	BUG_ON(!atomic_read(&h->ref));
-	nvmap_handle_put(h);
-}
-EXPORT_SYMBOL(nvmap_free_handle);
-
-void nvmap_free_handle_user_id(struct nvmap_client *client,
-			       unsigned long user_id)
-{
-	nvmap_free_handle(client, unmarshal_user_id(user_id));
-}
 
 static void add_handle_ref(struct nvmap_client *client,
 			   struct nvmap_handle_ref *ref)
@@ -504,6 +61,7 @@ static void add_handle_ref(struct nvmap_client *client,
 	client->handle_count++;
 	if (client->handle_count > nvmap_max_handle_count)
 		nvmap_max_handle_count = client->handle_count;
+	atomic_inc(&ref->handle->share_count);
 	nvmap_ref_unlock(client);
 }
 
@@ -531,12 +89,13 @@ struct nvmap_handle_ref *nvmap_create_handle(struct nvmap_client *client,
 	atomic_set(&h->ref, 1);
 	atomic_set(&h->pin, 0);
 	h->owner = client;
-	h->owner_ref = ref;
-	h->dev = nvmap_dev;
 	BUG_ON(!h->owner);
 	h->size = h->orig_size = size;
 	h->flags = NVMAP_HANDLE_WRITE_COMBINE;
+	h->peer = NVMAP_IVM_INVALID_PEER;
 	mutex_init(&h->lock);
+	INIT_LIST_HEAD(&h->vmas);
+	INIT_LIST_HEAD(&h->lru);
 
 	/*
 	 * This takes out 1 ref on the dambuf. This corresponds to the
@@ -552,7 +111,7 @@ struct nvmap_handle_ref *nvmap_create_handle(struct nvmap_client *client,
 	 * Pre-attach nvmap to this new dmabuf. This gets unattached during the
 	 * dma_buf_release() operation.
 	 */
-	h->attachment = dma_buf_attach(h->dmabuf, &nvmap_pdev->dev);
+	h->attachment = dma_buf_attach(h->dmabuf, nvmap_dev->dev_user.parent);
 	if (IS_ERR(h->attachment)) {
 		err = h->attachment;
 		goto dma_buf_attach_fail;
@@ -588,17 +147,17 @@ struct nvmap_handle_ref *nvmap_duplicate_handle(struct nvmap_client *client,
 	BUG_ON(!client);
 	/* on success, the reference count for the handle should be
 	 * incremented, so the success paths will not call nvmap_handle_put */
-	h = nvmap_handle_get(h);
+	h = nvmap_validate_get(h);
 
 	if (!h) {
-		nvmap_debug(client, "%s duplicate handle failed\n",
+		pr_debug("%s duplicate handle failed\n",
 			    current->group_leader->comm);
 		return ERR_PTR(-EPERM);
 	}
 
 	if (!h->alloc) {
-		nvmap_err(client, "%s duplicating unallocated handle\n",
-			  current->group_leader->comm);
+		pr_err("%s duplicating unallocated handle\n",
+			current->group_leader->comm);
 		nvmap_handle_put(h);
 		return ERR_PTR(-EINVAL);
 	}
@@ -620,16 +179,6 @@ struct nvmap_handle_ref *nvmap_duplicate_handle(struct nvmap_client *client,
 	if (!ref) {
 		nvmap_handle_put(h);
 		return ERR_PTR(-ENOMEM);
-	}
-
-	if (!h->heap_pgalloc) {
-		mutex_lock(&h->lock);
-		nvmap_carveout_commit_add(client,
-			nvmap_heap_to_arg(nvmap_block_to_heap(h->carveout)),
-			h->size);
-		mutex_unlock(&h->lock);
-	} else if (!h->pgalloc.contig) {
-		atomic_add(h->size, &client->iovm_commit);
 	}
 
 	atomic_set(&ref->dupes, 1);
@@ -657,128 +206,13 @@ struct nvmap_handle_ref *nvmap_create_handle_from_fd(
 
 	BUG_ON(!client);
 
-	handle = nvmap_get_id_from_dmabuf_fd(client, fd);
+	handle = nvmap_handle_get_from_dmabuf_fd(client, fd);
 	if (IS_ERR(handle))
 		return ERR_CAST(handle);
 	ref = nvmap_duplicate_handle(client, handle, 1);
+	nvmap_handle_put(handle);
 	return ref;
 }
-
-struct nvmap_handle *nvmap_duplicate_handle_id_ex(struct nvmap_client *client,
-							struct nvmap_handle *h)
-{
-	struct nvmap_handle_ref *ref = nvmap_duplicate_handle(client, h, 0);
-
-	if (IS_ERR(ref))
-		return 0;
-
-	return __nvmap_ref_to_id(ref);
-}
-EXPORT_SYMBOL(nvmap_duplicate_handle_id_ex);
-
-int nvmap_get_page_list_info(struct nvmap_client *client,
-				struct nvmap_handle *handle, u32 *size,
-				u32 *flags, u32 *nr_page, bool *contig)
-{
-	struct nvmap_handle *h;
-
-	BUG_ON(!size || !flags || !nr_page || !contig);
-	BUG_ON(!client);
-
-	*size = 0;
-	*flags = 0;
-	*nr_page = 0;
-
-	h = nvmap_handle_get(handle);
-
-	if (!h) {
-		nvmap_err(client, "%s query invalid handle %p\n",
-			  current->group_leader->comm, handle);
-		return -EINVAL;
-	}
-
-	if (!h->alloc || !h->heap_pgalloc) {
-		nvmap_err(client, "%s query unallocated handle %p\n",
-			  current->group_leader->comm, handle);
-		nvmap_handle_put(h);
-		return -EINVAL;
-	}
-
-	*flags = h->flags;
-	*size = h->orig_size;
-	*nr_page = PAGE_ALIGN(h->size) >> PAGE_SHIFT;
-	*contig = h->pgalloc.contig;
-
-	nvmap_handle_put(h);
-	return 0;
-}
-EXPORT_SYMBOL(nvmap_get_page_list_info);
-
-int nvmap_acquire_page_list(struct nvmap_client *client,
-			struct nvmap_handle *handle, struct page **pages,
-			u32 nr_page)
-{
-	struct nvmap_handle *h;
-	struct nvmap_handle_ref *ref;
-	int idx;
-	phys_addr_t dummy;
-
-	BUG_ON(!client);
-
-	h = nvmap_handle_get(handle);
-
-	if (!h) {
-		nvmap_err(client, "%s query invalid handle %p\n",
-			  current->group_leader->comm, handle);
-		return -EINVAL;
-	}
-
-	if (!h->alloc || !h->heap_pgalloc) {
-		nvmap_err(client, "%s query unallocated handle %p\n",
-			  current->group_leader->comm, handle);
-		nvmap_handle_put(h);
-		return -EINVAL;
-	}
-
-	BUG_ON(nr_page != PAGE_ALIGN(h->size) >> PAGE_SHIFT);
-
-	for (idx = 0; idx < nr_page; idx++)
-		pages[idx] = h->pgalloc.pages[idx];
-
-	nvmap_ref_lock(client);
-	ref = __nvmap_validate_locked(client, h);
-	if (ref)
-		__nvmap_pin(ref, &dummy);
-	nvmap_ref_unlock(client);
-
-	return 0;
-}
-EXPORT_SYMBOL(nvmap_acquire_page_list);
-
-int nvmap_release_page_list(struct nvmap_client *client,
-				struct nvmap_handle *handle)
-{
-	struct nvmap_handle_ref *ref;
-	struct nvmap_handle *h = NULL;
-
-	BUG_ON(!client);
-
-	nvmap_ref_lock(client);
-
-	ref = __nvmap_validate_locked(client, handle);
-	if (ref)
-		__nvmap_unpin(ref);
-
-	nvmap_ref_unlock(client);
-
-	if (ref)
-		h = ref->handle;
-	if (h)
-		nvmap_handle_put(h);
-
-	return 0;
-}
-EXPORT_SYMBOL(nvmap_release_page_list);
 
 int __nvmap_get_handle_param(struct nvmap_client *client,
 			     struct nvmap_handle *h, u32 param, u64 *result)
@@ -802,9 +236,7 @@ int __nvmap_get_handle_param(struct nvmap_client *client,
 			mutex_lock(&h->lock);
 			*result = h->carveout->base;
 			mutex_unlock(&h->lock);
-		} else if (h->pgalloc.contig)
-			*result = page_to_phys(h->pgalloc.pages[0]);
-		else if (h->attachment->priv)
+		} else if (h->attachment->priv)
 			*result = sg_dma_address(
 				((struct sg_table *)h->attachment->priv)->sgl);
 		else

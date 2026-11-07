@@ -48,8 +48,8 @@
 #define RM_VARIABLE_SET_WAKE_UNLOCK				0x0A
 #define RM_VARIABLE_DPW							0x0B
 #define RM_VARIABLE_NS_MODE						0x0C
-#define RM_VARIABLE_TOUCHFILE_STATUS            0x0D
-#define RM_VARIABLE_TOUCH_EVENT                 0x0E
+#define RM_VARIABLE_TOUCHFILE_STATUS			0x0D
+#define RM_VARIABLE_TOUCH_EVENT					0x0E
 
 
 #define RM_IOCTL_GET_VARIABLE				0x1011
@@ -61,6 +61,7 @@
 #define RM_IOCTL_WATCH_DOG					0x1014
 #define RM_IOCTL_SET_BASELINE				0x1015
 #define RM_IOCTL_INIT_SERVICE				0x1016
+#define RM_IOCTL_SET_CLK					0x1017
 
 #define RM_INPUT_RESOLUTION_X				4096
 #define RM_INPUT_RESOLUTION_Y				4096
@@ -99,6 +100,7 @@
 #define RM_PLATFORM_L005	0x09
 #define RM_PLATFORM_K156	0x0A
 #define RM_PLATFORM_T008	0x0B
+#define RM_PLATFORM_T008_2	0x0D
 #define RM_PLATFORM_RAYPRJ	0x80
 
 /***************************************************************************
@@ -131,6 +133,7 @@
 #define KRL_INDEX_RM_WRITE_IMG			13
 #define KRL_INDEX_RM_TLK				14
 #define KRL_INDEX_RM_KL_TESTMODE		15
+#define KRL_INDEX_RM_NS_SCF				16
 
 #define KRL_SIZE_SET_IDLE				128
 #define KRL_SIZE_PAUSE_AUTO				64
@@ -148,6 +151,7 @@
 #define KRL_SIZE_RM_WRITE_IMAGE			64
 #define KRL_SIZE_RM_TLK					128
 #define KRL_SIZE_RM_KL_TESTMODE			128
+#define KRL_SIZE_RM_SCF_PARA			64
 
 #define KRL_TBL_FIELD_POS_LEN_H				0
 #define KRL_TBL_FIELD_POS_LEN_L				1
@@ -222,7 +226,8 @@
 #define INPUT_PROTOCOL_TYPE_B	0x02
 #define INPUT_PROTOCOL_CURRENT_SUPPORT INPUT_PROTOCOL_TYPE_B
 
-#define INPUT_POINT_RESET	0x80
+#define INPUT_SLOT_RESET	0x80
+#define INPUT_ID_RESET		0xFF
 #define MAX_REPORT_TOUCHED_POINTS	10
 
 #define POINT_TYPE_NONE			0x00
@@ -240,19 +245,23 @@
 #define EVENT_REPORT_MODE_STYLUS_ONLY				0x05
 #define EVENT_REPORT_MODE_ERASER_ONLY				0x06
 #define EVENT_REPORT_MODE_TYPE_NUM					0x07
-#define EVENT_REPORT_MODE_ALL_TYPE_POINTS           0x10
-
 /***************************************************************************
  *	DO NOT MODIFY - Kernel Point Report Definition
  *	NOTE: Need to sync with HAL
  ***************************************************************************/
 
 /*#define ENABLE_CALC_QUEUE_COUNT*/
-#define ENABLE_SLOW_SCAN
+/*#define ENABLE_SLOW_SCAN*/
 #define ENABLE_SMOOTH_LEVEL
 #define ENABLE_SPI_SETTING		0
 #define ENABLE_FREQ_HOPPING		1
-#define ENABLE_FB_CALLBACK		0
+#define ENABLE_QUEUE_GUARD		0
+#define ENABLE_EVENT_QUEUE		0
+#define CS_SUPPORT
+
+#define ISR_POST_HANDLER WORK_QUEUE		/*or KTHREAD*/
+#define WORK_QUEUE	0
+#define KTHREAD		1
 
 enum tch_update_reason {
 	STYLUS_DISABLE_BY_WATER = 0x01,
@@ -272,6 +281,13 @@ struct rm_touch_event {
 	unsigned char uc_slot[RM_TS_MAX_POINTS];
 	unsigned char uc_pre_tool_type[RM_TS_MAX_POINTS];
 };
+
+#if ENABLE_EVENT_QUEUE
+struct rm_touch_event_list {
+	struct list_head next_event;
+	struct rm_touch_event *event_record;
+};
+#endif
 
 struct rm_spi_ts_platform_data {
 	int gpio_reset;

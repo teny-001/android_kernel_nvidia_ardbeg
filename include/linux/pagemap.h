@@ -243,8 +243,18 @@ static inline struct page *page_cache_alloc_readahead(struct address_space *x)
 
 typedef int filler_t(void *, struct page *);
 
-extern struct page * find_get_page(struct address_space *mapping,
-				pgoff_t index);
+extern struct page * find_get_page_flags(struct address_space *mapping,
+					 pgoff_t index, int fgp_flags);
+
+#define FGP_ACCESSED		0x00000001
+
+static inline struct page* find_get_page(struct address_space *mapping,
+					 pgoff_t index)
+{
+	return find_get_page_flags(mapping, index, 0);
+}
+
+
 extern struct page * find_lock_page(struct address_space *mapping,
 				pgoff_t index);
 extern struct page * find_or_create_page(struct address_space *mapping,
@@ -382,6 +392,8 @@ static inline int lock_page_or_retry(struct page *page, struct mm_struct *mm,
  */
 extern void wait_on_page_bit(struct page *page, int bit_nr);
 
+extern void wait_on_page_bit_timeout(struct page *page, int bit_nr);
+
 extern int wait_on_page_bit_killable(struct page *page, int bit_nr);
 
 static inline int wait_on_page_locked_killable(struct page *page)
@@ -402,6 +414,12 @@ static inline void wait_on_page_locked(struct page *page)
 {
 	if (PageLocked(page))
 		wait_on_page_bit(page, PG_locked);
+}
+
+static inline void wait_on_page_locked_timeout(struct page *page)
+{
+	if (PageLocked(page))
+		wait_on_page_bit_timeout(page, PG_locked);
 }
 
 /* 

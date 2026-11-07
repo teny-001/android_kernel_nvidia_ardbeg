@@ -1,8 +1,7 @@
 /*
- *
  * Tegra GK20A GPU Debugger Driver Register Ops
  *
- * Copyright (c) 2013-2014, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2013-2015, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -20,20 +19,14 @@
 #include <linux/slab.h>
 #include <linux/err.h>
 #include <linux/bsearch.h>
-#include <linux/nvhost_dbg_gpu_ioctl.h>
+#include <uapi/linux/nvgpu.h>
 
-#include "dev.h"
 #include "gk20a.h"
 #include "gr_gk20a.h"
 #include "dbg_gpu_gk20a.h"
 #include "regops_gk20a.h"
 
 
-
-struct regop_offset_range {
-	u32 base:24;
-	u32 count:8;
-};
 
 static int regop_bsearch_range_cmp(const void *pkey, const void *pelem)
 {
@@ -63,7 +56,6 @@ static const struct regop_offset_range gk20a_global_whitelist_ranges[] = {
 	{ 0x0000280c,   1 },
 	{ 0x00009400,   1 },
 	{ 0x00009410,   1 },
-	{ 0x00020200,   1 },
 	{ 0x00022430,   7 },
 	{ 0x00022548,   1 },
 	{ 0x00100c18,   3 },
@@ -98,7 +90,8 @@ static const struct regop_offset_range gk20a_global_whitelist_ranges[] = {
 	{ 0x001b4020,   3 },
 	{ 0x001b4040,   3 },
 	{ 0x001b4050,   3 },
-	{ 0x001b4060,  16 },
+	{ 0x001b4060,   4 },
+	{ 0x001b4074,  11 },
 	{ 0x001b40a4,   1 },
 	{ 0x001b4100,   6 },
 	{ 0x001b4124,   2 },
@@ -378,12 +371,12 @@ static const u32 gk20a_qctl_whitelist_ranges_count =
 
 static bool validate_reg_ops(struct dbg_session_gk20a *dbg_s,
 			     u32 *ctx_rd_count, u32 *ctx_wr_count,
-			     struct nvhost_dbg_gpu_reg_op *ops,
+			     struct nvgpu_dbg_gpu_reg_op *ops,
 			     u32 op_count);
 
 
 int exec_regops_gk20a(struct dbg_session_gk20a *dbg_s,
-		      struct nvhost_dbg_gpu_reg_op *ops,
+		      struct nvgpu_dbg_gpu_reg_op *ops,
 		      u64 num_ops)
 {
 	int err = 0, i;
@@ -399,9 +392,21 @@ int exec_regops_gk20a(struct dbg_session_gk20a *dbg_s,
 
 	ch = dbg_s->ch;
 
+	/* For vgpu, the regops routines need to be handled in the
+	 * context of the server and support for that does not exist.
+	 *
+	 * The two users of the regops interface are the compute driver
+	 * and tools. The compute driver will work without a functional
+	 * regops implementation, so we return -ENOSYS. This will allow
+	 * compute apps to run with vgpu. Tools will not work in this
+	 * configuration and are not required to work at this time. */
+	if (gk20a_gpu_is_virtual(dbg_s->pdev))
+		return -ENOSYS;
+
 	ok = validate_reg_ops(dbg_s,
 			      &ctx_rd_count, &ctx_wr_count,
 			      ops, num_ops);
+
 	if (!ok) {
 		dev_err(dbg_s->dev, "invalid op(s)");
 		err = -EINVAL;
@@ -508,7 +513,7 @@ int exec_regops_gk20a(struct dbg_session_gk20a *dbg_s,
 
 
 static int validate_reg_op_info(struct dbg_session_gk20a *dbg_s,
-				struct nvhost_dbg_gpu_reg_op *op)
+				struct nvgpu_dbg_gpu_reg_op *op)
 {
 	int err = 0;
 
@@ -537,7 +542,7 @@ static int validate_reg_op_info(struct dbg_session_gk20a *dbg_s,
 	case REGOP(TYPE_GR_CTX_QUAD):
 		break;
 	/*
-	case NVHOST_DBG_GPU_REG_OP_TYPE_FB:
+	case NVGPU_DBG_GPU_REG_OP_TYPE_FB:
 	*/
 	default:
 		op->status |= REGOP(STATUS_INVALID_TYPE);
@@ -550,60 +555,67 @@ static int validate_reg_op_info(struct dbg_session_gk20a *dbg_s,
 }
 
 static bool check_whitelists(struct dbg_session_gk20a *dbg_s,
-			  struct nvhost_dbg_gpu_reg_op *op, u32 offset)
+			  struct nvgpu_dbg_gpu_reg_op *op, u32 offset)
 {
+	struct gk20a *g = dbg_s->g;
 	bool valid = false;
 
 	if (op->type == REGOP(TYPE_GLOBAL)) {
 		/* search global list */
-		valid = !!bsearch(&offset,
-				  gk20a_global_whitelist_ranges,
-				  gk20a_global_whitelist_ranges_count,
-				  sizeof(*gk20a_global_whitelist_ranges),
-				  regop_bsearch_range_cmp);
+		valid = g->ops.regops.get_global_whitelist_ranges &&
+			!!bsearch(&offset,
+			g->ops.regops.get_global_whitelist_ranges(),
+			g->ops.regops.get_global_whitelist_ranges_count(),
+			sizeof(*g->ops.regops.get_global_whitelist_ranges()),
+			regop_bsearch_range_cmp);
 
 		/* if debug session and channel is bound search context list */
 		if ((!valid) && (!dbg_s->is_profiler && dbg_s->ch)) {
 			/* binary search context list */
-			valid = !!bsearch(&offset,
-					  gk20a_context_whitelist_ranges,
-					  gk20a_context_whitelist_ranges_count,
-					  sizeof(*gk20a_context_whitelist_ranges),
-					  regop_bsearch_range_cmp);
+			valid = g->ops.regops.get_context_whitelist_ranges &&
+				!!bsearch(&offset,
+			g->ops.regops.get_context_whitelist_ranges(),
+			g->ops.regops.get_context_whitelist_ranges_count(),
+			sizeof(*g->ops.regops.get_context_whitelist_ranges()),
+			regop_bsearch_range_cmp);
 		}
 
 		/* if debug session and channel is bound search runcontrol list */
 		if ((!valid) && (!dbg_s->is_profiler && dbg_s->ch)) {
-			valid = linear_search(offset,
-					      gk20a_runcontrol_whitelist,
-					      gk20a_runcontrol_whitelist_count);
+			valid = g->ops.regops.get_runcontrol_whitelist &&
+				linear_search(offset,
+				g->ops.regops.get_runcontrol_whitelist(),
+				g->ops.regops.get_runcontrol_whitelist_count());
 		}
 	} else if (op->type == REGOP(TYPE_GR_CTX)) {
 		/* it's a context-relative op */
 		if (!dbg_s->ch) {
 			gk20a_err(dbg_s->dev, "can't perform ctx regop unless bound");
 			op->status = REGOP(STATUS_UNSUPPORTED_OP);
-			return -ENODEV;
+			return valid;
 		}
 
 		/* binary search context list */
-		valid = !!bsearch(&offset,
-				  gk20a_context_whitelist_ranges,
-				  gk20a_context_whitelist_ranges_count,
-				  sizeof(*gk20a_context_whitelist_ranges),
-				  regop_bsearch_range_cmp);
+		valid = g->ops.regops.get_context_whitelist_ranges &&
+			!!bsearch(&offset,
+			g->ops.regops.get_context_whitelist_ranges(),
+			g->ops.regops.get_context_whitelist_ranges_count(),
+			sizeof(*g->ops.regops.get_context_whitelist_ranges()),
+			regop_bsearch_range_cmp);
 
 		/* if debug session and channel is bound search runcontrol list */
 		if ((!valid) && (!dbg_s->is_profiler && dbg_s->ch)) {
-			valid = linear_search(offset,
-					      gk20a_runcontrol_whitelist,
-					      gk20a_runcontrol_whitelist_count);
+			valid = g->ops.regops.get_runcontrol_whitelist &&
+				linear_search(offset,
+				g->ops.regops.get_runcontrol_whitelist(),
+				g->ops.regops.get_runcontrol_whitelist_count());
 		}
 
 	} else if (op->type == REGOP(TYPE_GR_CTX_QUAD)) {
-		valid = linear_search(offset,
-				      gk20a_qctl_whitelist,
-				      gk20a_qctl_whitelist_count);
+		valid = g->ops.regops.get_qctl_whitelist &&
+			linear_search(offset,
+				g->ops.regops.get_qctl_whitelist(),
+				g->ops.regops.get_qctl_whitelist_count());
 	}
 
 	return valid;
@@ -611,7 +623,7 @@ static bool check_whitelists(struct dbg_session_gk20a *dbg_s,
 
 /* note: the op here has already been through validate_reg_op_info */
 static int validate_reg_op_offset(struct dbg_session_gk20a *dbg_s,
-				  struct nvhost_dbg_gpu_reg_op *op)
+				  struct nvgpu_dbg_gpu_reg_op *op)
 {
 	int err;
 	u32 buf_offset_lo, buf_offset_addr, num_offsets, offset;
@@ -661,12 +673,13 @@ static int validate_reg_op_offset(struct dbg_session_gk20a *dbg_s,
 
 static bool validate_reg_ops(struct dbg_session_gk20a *dbg_s,
 			    u32 *ctx_rd_count, u32 *ctx_wr_count,
-			    struct nvhost_dbg_gpu_reg_op *ops,
+			    struct nvgpu_dbg_gpu_reg_op *ops,
 			    u32 op_count)
 {
 	u32 i;
 	int err;
 	bool ok = true;
+	struct gk20a *g = dbg_s->g;
 
 	/* keep going until the end so every op can get
 	 * a separate error code if needed */
@@ -682,24 +695,159 @@ static bool validate_reg_ops(struct dbg_session_gk20a *dbg_s,
 				(*ctx_wr_count)++;
 		}
 
-		err = validate_reg_op_offset(dbg_s, &ops[i]);
-		ok &= !err;
+		/* if "allow_all" flag enabled, dont validate offset */
+		if (!g->allow_all) {
+			err = validate_reg_op_offset(dbg_s, &ops[i]);
+			ok &= !err;
+		}
 	}
 
-	gk20a_dbg(gpu_dbg_gpu_dbg, "ctx_wrs:%d ctx_rds:%d\n",
+	gk20a_dbg(gpu_dbg_gpu_dbg, "ctx_wrs:%d ctx_rds:%d",
 		   *ctx_wr_count, *ctx_rd_count);
 
 	return ok;
 }
 
 /* exported for tools like cyclestats, etc */
-bool is_bar0_global_offset_whitelisted_gk20a(u32 offset)
+bool is_bar0_global_offset_whitelisted_gk20a(struct gk20a *g, u32 offset)
 {
-
 	bool valid = !!bsearch(&offset,
-			       gk20a_global_whitelist_ranges,
-			       gk20a_global_whitelist_ranges_count,
-			       sizeof(*gk20a_global_whitelist_ranges),
-			       regop_bsearch_range_cmp);
+			g->ops.regops.get_global_whitelist_ranges(),
+			g->ops.regops.get_global_whitelist_ranges_count(),
+			sizeof(*g->ops.regops.get_global_whitelist_ranges()),
+			regop_bsearch_range_cmp);
 	return valid;
+}
+
+static const struct regop_offset_range *gk20a_get_global_whitelist_ranges(void)
+{
+	return gk20a_global_whitelist_ranges;
+}
+
+static int gk20a_get_global_whitelist_ranges_count(void)
+{
+	return gk20a_global_whitelist_ranges_count;
+}
+
+static const struct regop_offset_range *gk20a_get_context_whitelist_ranges(void)
+{
+	return gk20a_context_whitelist_ranges;
+}
+
+static int gk20a_get_context_whitelist_ranges_count(void)
+{
+	return gk20a_context_whitelist_ranges_count;
+}
+
+static const u32 *gk20a_get_runcontrol_whitelist(void)
+{
+	return gk20a_runcontrol_whitelist;
+}
+
+static int gk20a_get_runcontrol_whitelist_count(void)
+{
+	return gk20a_runcontrol_whitelist_count;
+}
+
+static const
+struct regop_offset_range *gk20a_get_runcontrol_whitelist_ranges(void)
+{
+	return gk20a_runcontrol_whitelist_ranges;
+}
+
+static int gk20a_get_runcontrol_whitelist_ranges_count(void)
+{
+	return gk20a_runcontrol_whitelist_ranges_count;
+}
+
+static const u32 *gk20a_get_qctl_whitelist(void)
+{
+	return gk20a_qctl_whitelist;
+}
+
+static int gk20a_get_qctl_whitelist_count(void)
+{
+	return gk20a_qctl_whitelist_count;
+}
+
+static const struct regop_offset_range *gk20a_get_qctl_whitelist_ranges(void)
+{
+	return gk20a_qctl_whitelist_ranges;
+}
+
+static int gk20a_get_qctl_whitelist_ranges_count(void)
+{
+	return gk20a_qctl_whitelist_ranges_count;
+}
+
+static int gk20a_apply_smpc_war(struct dbg_session_gk20a *dbg_s)
+{
+	/* The following regops are a hack/war to make up for the fact that we
+	 * just scribbled into the ctxsw image w/o really knowing whether
+	 * it was already swapped out in/out once or not, etc.
+	 */
+	struct nvgpu_dbg_gpu_reg_op ops[4];
+	int i;
+	for (i = 0; i < ARRAY_SIZE(ops); i++) {
+		ops[i].op     = REGOP(WRITE_32);
+		ops[i].type   = REGOP(TYPE_GR_CTX);
+		ops[i].status = REGOP(STATUS_SUCCESS);
+		ops[i].value_hi      = 0;
+		ops[i].and_n_mask_lo = 0;
+		ops[i].and_n_mask_hi = 0;
+	}
+
+	/* gr_pri_gpcs_tpcs_sm_dsm_perf_counter_control_sel1_r();*/
+	ops[0].offset   = 0x00419e08;
+	ops[0].value_lo = 0x1d;
+
+	/* gr_pri_gpcs_tpcs_sm_dsm_perf_counter_control5_r(); */
+	ops[1].offset   = 0x00419e58;
+	ops[1].value_lo = 0x1;
+
+	/* gr_pri_gpcs_tpcs_sm_dsm_perf_counter_control3_r(); */
+	ops[2].offset   = 0x00419e68;
+	ops[2].value_lo = 0xaaaa;
+
+	/* gr_pri_gpcs_tpcs_sm_dsm_perf_counter4_control_r(); */
+	ops[3].offset   = 0x00419f40;
+	ops[3].value_lo = 0x18;
+
+	return dbg_s->ops->exec_reg_ops(dbg_s, ops, ARRAY_SIZE(ops));
+}
+
+void gk20a_init_regops(struct gpu_ops *gops)
+{
+	gops->regops.get_global_whitelist_ranges =
+		gk20a_get_global_whitelist_ranges;
+	gops->regops.get_global_whitelist_ranges_count =
+		gk20a_get_global_whitelist_ranges_count;
+
+	gops->regops.get_context_whitelist_ranges =
+		gk20a_get_context_whitelist_ranges;
+	gops->regops.get_context_whitelist_ranges_count =
+		gk20a_get_context_whitelist_ranges_count;
+
+	gops->regops.get_runcontrol_whitelist =
+		gk20a_get_runcontrol_whitelist;
+	gops->regops.get_runcontrol_whitelist_count =
+		gk20a_get_runcontrol_whitelist_count;
+
+	gops->regops.get_runcontrol_whitelist_ranges =
+		gk20a_get_runcontrol_whitelist_ranges;
+	gops->regops.get_runcontrol_whitelist_ranges_count =
+		gk20a_get_runcontrol_whitelist_ranges_count;
+
+	gops->regops.get_qctl_whitelist =
+		gk20a_get_qctl_whitelist;
+	gops->regops.get_qctl_whitelist_count =
+		gk20a_get_qctl_whitelist_count;
+
+	gops->regops.get_qctl_whitelist_ranges =
+		gk20a_get_qctl_whitelist_ranges;
+	gops->regops.get_qctl_whitelist_ranges_count =
+		gk20a_get_qctl_whitelist_ranges_count;
+
+	gops->regops.apply_smpc_war =
+		gk20a_apply_smpc_war;
 }

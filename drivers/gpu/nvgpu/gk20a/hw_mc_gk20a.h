@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2014, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2012-2015, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -110,14 +110,6 @@ static inline u32 mc_intr_mask_0_pmu_enabled_f(void)
 {
 	return 0x1000000;
 }
-static inline u32 mc_intr_mask_1_r(void)
-{
-	return 0x00000644;
-}
-static inline u32 mc_intr_mask_1_pmu_enabled_f(void)
-{
-	return 0x1000000;
-}
 static inline u32 mc_intr_en_0_r(void)
 {
 	return 0x00000140;
@@ -129,6 +121,30 @@ static inline u32 mc_intr_en_0_inta_disabled_f(void)
 static inline u32 mc_intr_en_0_inta_hardware_f(void)
 {
 	return 0x1;
+}
+static inline u32 mc_intr_mask_1_r(void)
+{
+	return 0x00000644;
+}
+static inline u32 mc_intr_mask_1_pmu_s(void)
+{
+	return 1;
+}
+static inline u32 mc_intr_mask_1_pmu_f(u32 v)
+{
+	return (v & 0x1) << 24;
+}
+static inline u32 mc_intr_mask_1_pmu_m(void)
+{
+	return 0x1 << 24;
+}
+static inline u32 mc_intr_mask_1_pmu_v(u32 r)
+{
+	return (r >> 24) & 0x1;
+}
+static inline u32 mc_intr_mask_1_pmu_enabled_f(void)
+{
+	return 0x1000000;
 }
 static inline u32 mc_intr_en_1_r(void)
 {
@@ -249,5 +265,21 @@ static inline u32 mc_enable_pb_0_enabled_v(void)
 static inline u32 mc_enable_pb_sel_f(u32 v, u32 i)
 {
 	return (v & 0x1) << (0 + i*1);
+}
+static inline u32 mc_elpg_enable_r(void)
+{
+	return 0x0000020c;
+}
+static inline u32 mc_elpg_enable_xbar_enabled_f(void)
+{
+	return 0x4;
+}
+static inline u32 mc_elpg_enable_pfb_enabled_f(void)
+{
+	return 0x100000;
+}
+static inline u32 mc_elpg_enable_hub_enabled_f(void)
+{
+	return 0x20000000;
 }
 #endif

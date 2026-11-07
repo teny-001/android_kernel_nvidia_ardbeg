@@ -1,7 +1,7 @@
 /*
  * GK20A Graphics Context Pri Register Addressing
  *
- * Copyright (c) 2013, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2014, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -15,8 +15,8 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-#ifndef _NVHOST_GR_PRI_GK20A_H_
-#define _NVHOST_GR_PRI_GK20A_H_
+#ifndef GR_PRI_GK20A_H
+#define GR_PRI_GK20A_H
 
 /*
  * These convenience macros are generally for use in the management/modificaiton
@@ -84,26 +84,6 @@ static inline bool pri_is_tpc_addr_shared(u32 addr)
 	return (addr >= proj_tpc_in_gpc_shared_base_v()) &&
 		(addr < (proj_tpc_in_gpc_shared_base_v() +
 			 proj_tpc_in_gpc_stride_v()));
-}
-static inline bool pri_is_tpc_addr(u32 addr)
-{
-	return ((addr >= proj_tpc_in_gpc_base_v()) &&
-		(addr < proj_tpc_in_gpc_base_v() + (proj_scal_litter_num_tpc_per_gpc_v() *
-						    proj_tpc_in_gpc_stride_v())))
-		||
-		pri_is_tpc_addr_shared(addr);
-}
-static inline u32 pri_get_tpc_num(u32 addr)
-{
-	u32 i, start;
-	u32 num_tpcs = proj_scal_litter_num_tpc_per_gpc_v();
-
-	for (i = 0; i < num_tpcs; i++) {
-		start = proj_tpc_in_gpc_base_v() + (i * proj_tpc_in_gpc_stride_v());
-		if ((addr >= start) && (addr < (start + proj_tpc_in_gpc_stride_v())))
-			return i;
-	}
-	return 0;
 }
 
 /*
@@ -176,4 +156,4 @@ enum ctxsw_addr_type {
 #define PRI_BROADCAST_FLAGS_BE    BIT(2)
 #define PRI_BROADCAST_FLAGS_PPC   BIT(3)
 
-#endif /*_NVHOST_GR_PRI_GK20A_H_ */
+#endif /* GR_PRI_GK20A_H */

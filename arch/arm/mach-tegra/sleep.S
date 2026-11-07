@@ -41,8 +41,8 @@
 #include "iomap.h"
 
 #include "sleep.h"
-#include "flowctrl.h"
-#include "reset.h"
+#include <linux/platform/tegra/flowctrl.h>
+#include <linux/platform/tegra/reset.h>
 
 #define CLK_RESET_CCLK_BURST		0x20
 #define CLK_RESET_CCLK_DIVIDER		0x24
@@ -52,7 +52,7 @@
 #define TEGRA_FLOW_CTRL_VIRT (TEGRA_FLOW_CTRL_BASE - IO_PPSB_PHYS \
 					+ IO_PPSB_VIRT)
 
-#define TEGRA_SMC_RESTART (60 << 24)
+#define TEGRA_REGISTER_LP0_IRAM_VECTOR	0x82000013
 
 /*
  * tegra_pen_lock
@@ -298,17 +298,6 @@ tegra_shut_off_mmu:
 	tst	r11, #1
 	beq	2f
 	mov32	r1, TEGRA_ARM_PL310_BASE
-#ifdef CONFIG_ARCH_TEGRA_14x_SOC
-	/* need to flush the L2 */
-	ldr	r2, [r1, #L2X0_AUX_CTRL]
-	tst	r2, #(1 << 16)			@ associativity
-	mov	r2, #0xff
-	orrne	r2, #0xff00
-	str	r2, [r1, #L2X0_CLEAN_INV_WAY]
-1:	ldr	r3, [r1, #L2X0_CLEAN_INV_WAY]
-	tst	r3, r2
-	bne	1b
-#endif /* CONFIG_ARCH_TEGRA_14x_SOC */
 	/* Sync and disable L2 */
 	mov	r2, #0
 	str	r2, [r1, #L2X0_CACHE_SYNC]
@@ -331,20 +320,23 @@ ENTRY(tegra_cpu_pllp)
 	str	r0, [r5, #CLK_RESET_CCLK_DIVIDER]
 	mov	pc, lr
 ENDPROC(tegra_cpu_pllp)
-#endif
 
 /*
- * tegra_restart_prev_smc
+ * tegra_register_suspend_vectors
  *
- * issues TEGRA_SMC_RESTART, to restart execution of the previous SMC
+ * r1 = IRAM MC_CLK_STOP handler address
+ * r2 = IRAM CORE_STOP handler address
+ *
+ * registers the IRAM LP0 vector
  */
-ENTRY(tegra_restart_prev_smc)
+ENTRY(tegra_register_suspend_vectors)
 	stmfd	sp!, { r1-r3 }
-	mov	r0, #TEGRA_SMC_RESTART
-	mov	r1, #0
-	mov	r2, #0
+	mov	r2, r1
+	mov	r1, r0
 	mov	r3, #0
+	ldr	r0, =TEGRA_REGISTER_LP0_IRAM_VECTOR
 	smc	#0
 	ldmia	sp!, { r1-r3 }
 	mov	pc, lr
-ENDPROC(tegra_restart_prev_smc)
+ENDPROC(tegra_register_suspend_vectors)
+#endif

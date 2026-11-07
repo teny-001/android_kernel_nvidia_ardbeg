@@ -7,6 +7,18 @@ ORIG_CFLAGS := $(KBUILD_CFLAGS)
 KBUILD_CFLAGS = $(subst -pg,,$(ORIG_CFLAGS))
 endif
 
+# These files are disabled because they produce lots of non-interesting and/or
+# flaky coverage that is not a function of syscall inputs. For example,
+# rbtree can be global and individual rotations don't correlate with inputs.
+KCOV_INSTRUMENT_string.o := n
+KCOV_INSTRUMENT_rbtree.o := n
+KCOV_INSTRUMENT_list_debug.o := n
+KCOV_INSTRUMENT_debugobjects.o := n
+KCOV_INSTRUMENT_dynamic_debug.o := n
+# Kernel does not boot if we instrument this file as it uses custom calling
+# convention (see CONFIG_ARCH_HWEIGHT_CFLAGS).
+KCOV_INSTRUMENT_hweight.o := n
+
 lib-y := ctype.o string.o vsprintf.o cmdline.o \
 	 rbtree.o radix-tree.o dump_stack.o timerqueue.o\
 	 idr.o int_sqrt.o extable.o \
@@ -76,6 +88,9 @@ obj-$(CONFIG_REED_SOLOMON) += reed_solomon/
 obj-$(CONFIG_BCH) += bch.o
 obj-$(CONFIG_LZO_COMPRESS) += lzo/
 obj-$(CONFIG_LZO_DECOMPRESS) += lzo/
+obj-$(CONFIG_LZ4_COMPRESS) += lz4/
+obj-$(CONFIG_LZ4HC_COMPRESS) += lz4/
+obj-$(CONFIG_LZ4_DECOMPRESS) += lz4/
 obj-$(CONFIG_XZ_DEC) += xz/
 obj-$(CONFIG_RAID6_PQ) += raid6/
 
@@ -84,6 +99,7 @@ lib-$(CONFIG_DECOMPRESS_BZIP2) += decompress_bunzip2.o
 lib-$(CONFIG_DECOMPRESS_LZMA) += decompress_unlzma.o
 lib-$(CONFIG_DECOMPRESS_XZ) += decompress_unxz.o
 lib-$(CONFIG_DECOMPRESS_LZO) += decompress_unlzo.o
+lib-$(CONFIG_DECOMPRESS_LZ4) += decompress_unlz4.o
 
 obj-$(CONFIG_TEXTSEARCH) += textsearch.o
 obj-$(CONFIG_TEXTSEARCH_KMP) += ts_kmp.o

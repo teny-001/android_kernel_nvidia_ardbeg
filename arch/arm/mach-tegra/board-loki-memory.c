@@ -21,7 +21,7 @@
 #include "board.h"
 #include "board-loki.h"
 #include "tegra-board-id.h"
-#include "tegra12_emc.h"
+#include <linux/platform/tegra/tegra12_emc.h>
 #include "devices.h"
 
 static struct tegra12_emc_table loki_b00_sku0_emc_table[] = {
@@ -18158,13 +18158,12 @@ int __init loki_emc_init(void)
 				break;
 			case BOARD_SKU_100:
 			default:
-				WARN(1,
-				    "EMC for this loki sku not supported: %u\n",
-				    bi.sku);
+				WARN(1, "EMC for this loki sku not supported: %u\n",
+						bi.sku);
 				return -EINVAL;
 			}
 		} else if (bi.board_id == BOARD_E2549) {
-			pr_info("Loading Thor 1.95 EMC table:0x%08x\n", bi.sku);
+			pr_info("Loading Thor 1.95 EMC table: 0x%08x\n", bi.sku);
 			tegra_emc_device.dev.platform_data =
 				&thor_195_b00_emc_pdata;
 		} else if (bi.board_id == BOARD_P2530 &&
@@ -18182,6 +18181,7 @@ int __init loki_emc_init(void)
 					bi.sku);
 				tegra_emc_device.dev.platform_data =
 					&loki_ffd_a00_sku100_emc_pdata;
+				break;
 			default:
 				WARN(1, "EMC for this loki sku not supported: %u\n",
 						bi.sku);
@@ -18219,7 +18219,6 @@ int __init loki_emc_init(void)
 
 		platform_device_register(&tegra_emc_device);
 	}
-
 	tegra12_emc_init();
 	return 0;
 }

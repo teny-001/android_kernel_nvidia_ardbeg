@@ -727,6 +727,12 @@ ssize_t tcp_splice_read(struct socket *sock, loff_t *ppos,
 				ret = -EAGAIN;
 				break;
 			}
+			/* if __tcp_splice_read() got nothing while we have
+			 * an skb in receive queue, we do not want to loop.
+			 * This might happen with URG data.
+			 */
+			if (!skb_queue_empty(&sk->sk_receive_queue))
+				break;
 			sk_wait_data(sk, &timeo);
 			if (signal_pending(current)) {
 				ret = sock_intr_errno(timeo);
@@ -1005,7 +1011,8 @@ void tcp_free_fastopen_req(struct tcp_sock *tp)
 	}
 }
 
-static int tcp_sendmsg_fastopen(struct sock *sk, struct msghdr *msg, int *size)
+static int tcp_sendmsg_fastopen(struct sock *sk, struct msghdr *msg,
+				int *copied, size_t size)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	int err, flags;
@@ -1020,11 +1027,12 @@ static int tcp_sendmsg_fastopen(struct sock *sk, struct msghdr *msg, int *size)
 	if (unlikely(tp->fastopen_req == NULL))
 		return -ENOBUFS;
 	tp->fastopen_req->data = msg;
+	tp->fastopen_req->size = size;
 
 	flags = (msg->msg_flags & MSG_DONTWAIT) ? O_NONBLOCK : 0;
 	err = __inet_stream_connect(sk->sk_socket, msg->msg_name,
 				    msg->msg_namelen, flags);
-	*size = tp->fastopen_req->copied;
+	*copied = tp->fastopen_req->copied;
 	tcp_free_fastopen_req(tp);
 	return err;
 }
@@ -1044,7 +1052,7 @@ int tcp_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 
 	flags = msg->msg_flags;
 	if (flags & MSG_FASTOPEN) {
-		err = tcp_sendmsg_fastopen(sk, msg, &copied_syn);
+		err = tcp_sendmsg_fastopen(sk, msg, &copied_syn, size);
 		if (err == -EINPROGRESS && copied_syn > 0)
 			goto out;
 		else if (err)
@@ -1067,7 +1075,7 @@ int tcp_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 	if (unlikely(tp->repair)) {
 		if (tp->repair_queue == TCP_RECV_QUEUE) {
 			copied = tcp_send_rcvq(sk, msg, size);
-			goto out;
+			goto out_nopush;
 		}
 
 		err = -EINVAL;
@@ -1240,6 +1248,7 @@ wait_for_memory:
 out:
 	if (copied)
 		tcp_push(sk, flags, mss_now, tp->nonagle);
+out_nopush:
 	release_sock(sk);
 
 	if (copied + copied_syn)
@@ -3368,6 +3377,43 @@ void tcp_done(struct sock *sk)
 }
 EXPORT_SYMBOL_GPL(tcp_done);
 
+int tcp_abort(struct sock *sk, int err)
+{
+	if (sk->sk_state == TCP_TIME_WAIT) {
+		inet_twsk_put((struct inet_timewait_sock *)sk);
+		return -EOPNOTSUPP;
+	}
+
+	/* Don't race with userspace socket closes such as tcp_close. */
+	lock_sock(sk);
+
+	if (sk->sk_state == TCP_LISTEN) {
+		tcp_set_state(sk, TCP_CLOSE);
+		inet_csk_listen_stop(sk);
+	}
+
+	/* Don't race with BH socket closes such as inet_csk_listen_stop. */
+	local_bh_disable();
+	bh_lock_sock(sk);
+
+	if (!sock_flag(sk, SOCK_DEAD)) {
+		sk->sk_err = err;
+		/* This barrier is coupled with smp_rmb() in tcp_poll() */
+		smp_wmb();
+		sk->sk_error_report(sk);
+		if (tcp_need_reset(sk->sk_state))
+			tcp_send_active_reset(sk, GFP_ATOMIC);
+		tcp_done(sk);
+	}
+
+	bh_unlock_sock(sk);
+	local_bh_enable();
+	release_sock(sk);
+	sock_put(sk);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(tcp_abort);
+
 extern struct tcp_congestion_ops tcp_reno;
 
 static __initdata unsigned long thash_entries;
@@ -3519,7 +3565,7 @@ int tcp_nuke_addr(struct net *net, struct sockaddr *addr)
 		return -EAFNOSUPPORT;
 	}
 
-	for (bucket = 0; bucket < tcp_hashinfo.ehash_mask; bucket++) {
+	for (bucket = 0; bucket <= tcp_hashinfo.ehash_mask; bucket++) {
 		struct hlist_nulls_node *node;
 		struct sock *sk;
 		spinlock_t *lock = inet_ehash_lockp(&tcp_hashinfo, bucket);
@@ -3528,6 +3574,9 @@ restart:
 		spin_lock_bh(lock);
 		sk_nulls_for_each(sk, node, &tcp_hashinfo.ehash[bucket].chain) {
 			struct inet_sock *inet = inet_sk(sk);
+
+			if (sk->sk_state == TCP_TIME_WAIT)
+				continue;
 
 			if (sysctl_ip_dynaddr && sk->sk_state == TCP_SYN_SENT)
 				continue;
@@ -3565,14 +3614,20 @@ restart:
 			sock_hold(sk);
 			spin_unlock_bh(lock);
 
+			lock_sock(sk);
 			local_bh_disable();
 			bh_lock_sock(sk);
-			sk->sk_err = ETIMEDOUT;
-			sk->sk_error_report(sk);
 
-			tcp_done(sk);
+			if (!sock_flag(sk, SOCK_DEAD)) {
+				smp_wmb();  /* be consistent with tcp_reset */
+				sk->sk_err = ETIMEDOUT;
+				sk->sk_error_report(sk);
+				tcp_done(sk);
+			}
+
 			bh_unlock_sock(sk);
 			local_bh_enable();
+			release_sock(sk);
 			sock_put(sk);
 
 			goto restart;

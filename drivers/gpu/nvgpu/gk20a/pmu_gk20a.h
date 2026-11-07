@@ -3,7 +3,7 @@
  *
  * GK20A PMU (aka. gPMU outside gk20a context)
  *
- * Copyright (c) 2011-2014, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2011-2016, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -22,9 +22,7 @@
 #define __PMU_GK20A_H__
 
 /* defined by pmu hw spec */
-#define GK20A_PMU_VA_START		((128 * 1024) << 10)
 #define GK20A_PMU_VA_SIZE		(512 * 1024 * 1024)
-#define GK20A_PMU_INST_SIZE		(4 * 1024)
 #define GK20A_PMU_UCODE_SIZE_MAX	(256 * 1024)
 #define GK20A_PMU_SEQ_BUF_SIZE		4096
 
@@ -51,6 +49,14 @@
 /* Mapping between AP_CTRLs and Idle counters */
 #define PMU_AP_IDLE_MASK_GRAPHICS	(PMU_AP_IDLE_MASK_HIST_IDX_1)
 
+#define APP_VERSION_T186_0	19494277
+#define APP_VERSION_GM20B_5 20490253
+#define APP_VERSION_GM20B_4 20432445
+#define APP_VERSION_GM20B_3 18935575
+#define APP_VERSION_GM20B_2 18694072
+#define APP_VERSION_GM20B_1 18547257
+#define APP_VERSION_GM20B 17615280
+#define APP_VERSION_2 18542378
 #define APP_VERSION_1 17997577
 #define APP_VERSION_0 16856675
 
@@ -257,7 +263,7 @@ union pmu_ap_msg {
 #define APCTRL_MINIMUM_IDLE_FILTER_DEFAULT_US                   (100)
 #define APCTRL_MINIMUM_TARGET_SAVING_DEFAULT_US                 (10000)
 #define APCTRL_POWER_BREAKEVEN_DEFAULT_US                       (2000)
-#define APCTRL_CYCLES_PER_SAMPLE_MAX_DEFAULT                    (100)
+#define APCTRL_CYCLES_PER_SAMPLE_MAX_DEFAULT                    (200)
 
 /*
  * Disable reason for Adaptive Power Controller
@@ -288,7 +294,6 @@ struct pmu_ap {
 	struct ap_ctrl		ap_ctrl[PMU_AP_CTRL_ID_MAX];
 };
 
-
 enum {
 	GK20A_PMU_DMAIDX_UCODE		= 0,
 	GK20A_PMU_DMAIDX_VIRT		= 1,
@@ -300,6 +305,20 @@ enum {
 	GK20A_PMU_DMAIDX_END		= 7
 };
 
+struct falc_u64 {
+	u32 lo;
+	u32 hi;
+};
+
+struct falc_dma_addr {
+	u32 dma_base;
+	/*dma_base1 is 9-bit MSB for FB Base
+	 *address for the transfer in FB after
+	 *address using 49b FB address*/
+	u16 dma_base1;
+	u8 dma_offset;
+};
+
 struct pmu_mem_v0 {
 	u32 dma_base;
 	u8  dma_offset;
@@ -309,6 +328,12 @@ struct pmu_mem_v0 {
 struct pmu_mem_v1 {
 	u32 dma_base;
 	u8  dma_offset;
+	u8  dma_idx;
+	u16 fb_size;
+};
+
+struct pmu_mem_v2 {
+	struct falc_dma_addr dma_addr;
 	u8  dma_idx;
 	u16 fb_size;
 };
@@ -336,6 +361,44 @@ struct pmu_cmdline_args_v1 {
 	struct pmu_mem_v1 gc6_ctx;		/* dmem offset of gc6 context */
 };
 
+struct pmu_cmdline_args_v2 {
+	u32 cpu_freq_hz;		/* Frequency of the clock driving PMU */
+	u32 falc_trace_size;		/* falctrace buffer size (bytes) */
+	u32 falc_trace_dma_base;	/* 256-byte block address */
+	u32 falc_trace_dma_idx;		/* dmaIdx for DMA operations */
+	u8 secure_mode;
+	u8 raise_priv_sec;     /*Raise priv level required for desired
+					registers*/
+	struct pmu_mem_v1 gc6_ctx;		/* dmem offset of gc6 context */
+};
+
+struct pmu_cmdline_args_v3 {
+	u32 reserved;
+	u32 cpu_freq_hz;		/* Frequency of the clock driving PMU */
+	u32 falc_trace_size;		/* falctrace buffer size (bytes) */
+	u32 falc_trace_dma_base;	/* 256-byte block address */
+	u32 falc_trace_dma_idx;		/* dmaIdx for DMA operations */
+	u8 secure_mode;
+	u8 raise_priv_sec;     /*Raise priv level required for desired
+					registers*/
+	struct pmu_mem_v1 gc6_ctx;		/* dmem offset of gc6 context */
+};
+
+struct pmu_cmdline_args_v4 {
+	u32 reserved;
+	u32 cpu_freq_hz;		/* Frequency of the clock driving PMU */
+	u32 falc_trace_size;		/* falctrace buffer size (bytes) */
+	struct falc_dma_addr dma_addr;	/* 256-byte block address */
+	u32 falc_trace_dma_idx;		/* dmaIdx for DMA operations */
+	u8 secure_mode;
+	u8 raise_priv_sec;     /*Raise priv level required for desired
+					registers*/
+	struct pmu_mem_v2 gc6_ctx;		/* dmem offset of gc6 context */
+	u8 pad;
+};
+
+
+#define GK20A_PMU_TRACE_BUFSIZE     0x4000   /* 4K */
 #define GK20A_PMU_DMEM_BLKSIZE2		8
 
 #define GK20A_PMU_UCODE_NB_MAX_OVERLAY	    32
@@ -375,7 +438,7 @@ struct pmu_ucode_desc {
 #define PMU_UNIT_INIT		(0x07)
 #define PMU_UNIT_FBBA		(0x08)
 #define PMU_UNIT_DIDLE		(0x09)
-#define PMU_UNIT_AVAILABLE3	(0x0A)
+#define PMU_UNIT_ACR		(0x0A)
 #define PMU_UNIT_AVAILABLE4	(0x0B)
 #define PMU_UNIT_HDCP_MAIN	(0x0C)
 #define PMU_UNIT_HDCP_V		(0x0D)
@@ -409,7 +472,7 @@ struct pmu_ucode_desc {
 #define PMU_UNIT_ID_IS_VALID(id)		\
 		(((id) < PMU_UNIT_END) || ((id) >= PMU_UNIT_TEST_START))
 
-#define PMU_DMEM_ALLOC_ALIGNMENT	(32)
+#define PMU_DMEM_ALLOC_ALIGNMENT	(4)
 #define PMU_DMEM_ALIGNMENT		(4)
 
 #define PMU_CMD_FLAGS_PMU_MASK		(0xF0)
@@ -443,6 +506,13 @@ struct pmu_allocation_v1 {
 	struct {
 		struct pmu_dmem dmem;
 		struct pmu_mem_v1 fb;
+	} alloc;
+};
+
+struct pmu_allocation_v2 {
+	struct {
+		struct pmu_dmem dmem;
+		struct pmu_mem_v2 fb;
 	} alloc;
 };
 
@@ -595,7 +665,7 @@ struct pmu_pg_cmd_elpg_cmd {
 	u16 cmd;
 };
 
-struct pmu_pg_cmd_eng_buf_load {
+struct pmu_pg_cmd_eng_buf_load_v0 {
 	u8 cmd_type;
 	u8 engine_id;
 	u8 buf_idx;
@@ -604,6 +674,18 @@ struct pmu_pg_cmd_eng_buf_load {
 	u32 dma_base;
 	u8 dma_offset;
 	u8 dma_idx;
+};
+
+struct pmu_pg_cmd_eng_buf_load_v1 {
+	u8 cmd_type;
+	u8 engine_id;
+	u8 buf_idx;
+	u8 pad;
+	struct flcn_mem_desc {
+		struct falc_u64 dma_addr;
+		u16 dma_size;
+		u8 dma_idx;
+	} dma_desc;
 };
 
 enum {
@@ -621,12 +703,111 @@ struct pmu_pg_cmd {
 	union {
 		u8 cmd_type;
 		struct pmu_pg_cmd_elpg_cmd elpg_cmd;
-		struct pmu_pg_cmd_eng_buf_load eng_buf_load;
+		struct pmu_pg_cmd_eng_buf_load_v0 eng_buf_load_v0;
+		struct pmu_pg_cmd_eng_buf_load_v1 eng_buf_load_v1;
 		struct pmu_pg_cmd_stat stat;
 		/* TBD: other pg commands */
 		union pmu_ap_cmd ap_cmd;
 	};
 };
+
+/* ACR Commands/Message structures */
+
+enum {
+	PMU_ACR_CMD_ID_INIT_WPR_REGION = 0x0          ,
+	PMU_ACR_CMD_ID_BOOTSTRAP_FALCON,
+	PMU_ACR_CMD_ID_RESERVED,
+	PMU_ACR_CMD_ID_BOOTSTRAP_MULTIPLE_FALCONS,
+};
+
+/*
+ * Initializes the WPR region details
+ */
+struct pmu_acr_cmd_init_wpr_details {
+	u8  cmd_type;
+	u32 regionid;
+	u32 wproffset;
+
+};
+
+/*
+ * falcon ID to bootstrap
+ */
+struct pmu_acr_cmd_bootstrap_falcon {
+	u8 cmd_type;
+	u32 flags;
+	u32 falconid;
+};
+
+/*
+ * falcon ID to bootstrap
+ */
+struct pmu_acr_cmd_bootstrap_multiple_falcons {
+	u8 cmd_type;
+	u32 flags;
+	u32 falconidmask;
+	u32 usevamask;
+	struct falc_u64 wprvirtualbase;
+};
+
+#define PMU_ACR_CMD_BOOTSTRAP_FALCON_FLAGS_RESET_NO  1
+#define PMU_ACR_CMD_BOOTSTRAP_FALCON_FLAGS_RESET_YES 0
+
+
+struct pmu_acr_cmd {
+	union {
+		u8 cmd_type;
+		struct pmu_acr_cmd_bootstrap_falcon bootstrap_falcon;
+		struct pmu_acr_cmd_init_wpr_details init_wpr;
+		struct pmu_acr_cmd_bootstrap_multiple_falcons boot_falcons;
+	};
+};
+
+/* acr messages */
+
+/*
+ * returns the WPR region init information
+ */
+#define PMU_ACR_MSG_ID_INIT_WPR_REGION   0
+
+/*
+ * Returns the Bootstrapped falcon ID to RM
+ */
+#define PMU_ACR_MSG_ID_BOOTSTRAP_FALCON  1
+
+/*
+ * Returns the WPR init status
+ */
+#define PMU_ACR_SUCCESS                  0
+#define PMU_ACR_ERROR                    1
+
+/*
+ * PMU notifies about bootstrap status of falcon
+ */
+struct pmu_acr_msg_bootstrap_falcon {
+	u8 msg_type;
+	union {
+		u32 errorcode;
+		u32 falconid;
+	};
+};
+
+struct pmu_acr_msg {
+	union {
+		u8 msg_type;
+		struct pmu_acr_msg_bootstrap_falcon acrmsg;
+	};
+};
+
+/***************************** ACR ERROR CODES  ******************************/
+/*!
+ * Error codes used in PMU-ACR Task
+ *
+ * LSF_ACR_INVALID_TRANSCFG_SETUP : Indicates that TRANSCFG Setup is not valid
+ *  MAILBOX1 returns the CTXDMA ID of invalid setup
+ *
+ */
+#define ACR_ERROR_INVALID_TRANSCFG_SETUP        (0xAC120001)
 
 /* PERFMON */
 #define PMU_DOMAIN_GROUP_PSTATE		0
@@ -637,13 +818,23 @@ struct pmu_pg_cmd {
 #define PMU_PERFMON_PCT_TO_INC		58
 #define PMU_PERFMON_PCT_TO_DEC		23
 
-struct pmu_perfmon_counter {
+struct pmu_perfmon_counter_v0 {
 	u8 index;
 	u8 flags;
 	u8 group_id;
 	u8 valid;
 	u16 upper_threshold; /* units of 0.01% */
 	u16 lower_threshold; /* units of 0.01% */
+};
+
+struct pmu_perfmon_counter_v2 {
+	u8 index;
+	u8 flags;
+	u8 group_id;
+	u8 valid;
+	u16 upper_threshold; /* units of 0.01% */
+	u16 lower_threshold; /* units of 0.01% */
+	u32 scale;
 };
 
 #define PMU_PERFMON_FLAG_ENABLE_INCREASE	(0x00000001)
@@ -745,6 +936,7 @@ struct pmu_cmd {
 		struct pmu_perfmon_cmd perfmon;
 		struct pmu_pg_cmd pg;
 		struct pmu_zbc_cmd zbc;
+		struct pmu_acr_cmd acr;
 	} cmd;
 };
 
@@ -755,6 +947,7 @@ struct pmu_msg {
 		struct pmu_perfmon_msg perfmon;
 		struct pmu_pg_msg pg;
 		struct pmu_rc_msg rc;
+		struct pmu_acr_msg acr;
 	} msg;
 };
 
@@ -988,22 +1181,26 @@ struct pmu_pg_stats {
 
 /* Choices for pmu_state */
 #define PMU_STATE_OFF			0 /* PMU is off */
-#define PMU_STATE_STARTING		1 /* PMU is booting */
-#define PMU_STATE_ELPG_BOOTED		2 /* ELPG is initialized */
-#define PMU_STATE_LOADING_PG_BUF	3 /* Loading PG buf */
-#define PMU_STATE_LOADING_ZBC		4 /* Loading ZBC buf */
-#define PMU_STATE_STARTED		5 /* Fully unitialized */
+#define PMU_STATE_STARTING		1 /* PMU is on, but not booted */
+#define PMU_STATE_INIT_RECEIVED		2 /* PMU init message received */
+#define PMU_STATE_ELPG_BOOTING		3 /* PMU is booting */
+#define PMU_STATE_ELPG_BOOTED		4 /* ELPG is initialized */
+#define PMU_STATE_LOADING_PG_BUF	5 /* Loading PG buf */
+#define PMU_STATE_LOADING_ZBC		6 /* Loading ZBC buf */
+#define PMU_STATE_STARTED		7 /* Fully unitialized */
+
+
 
 struct pmu_gk20a {
 
-	struct gk20a *g;
-
 	struct pmu_ucode_desc *desc;
-	struct pmu_mem_desc ucode;
+	struct mem_desc ucode;
 
-	struct pmu_mem_desc pg_buf;
+	struct mem_desc pg_buf;
 	/* TBD: remove this if ZBC seq is fixed */
-	struct pmu_mem_desc seq_buf;
+	struct mem_desc seq_buf;
+	struct mem_desc trace_buf;
+	struct mem_desc wpr_buf;
 	bool buf_loaded;
 
 	struct pmu_sha1_gid gid_info;
@@ -1038,7 +1235,10 @@ struct pmu_gk20a {
 	struct mutex elpg_mutex; /* protect elpg enable/disable */
 	int elpg_refcnt; /* disable -1, enable +1, <=0 elpg disabled, > 0 elpg enabled */
 
-	struct pmu_perfmon_counter perfmon_counter;
+	union {
+		struct pmu_perfmon_counter_v2 perfmon_counter_v2;
+		struct pmu_perfmon_counter_v0 perfmon_counter_v0;
+	};
 	u32 perfmon_state_id[PMU_DOMAIN_GROUP_NUM];
 
 	bool initialized;
@@ -1048,16 +1248,25 @@ struct pmu_gk20a {
 	bool perfmon_ready;
 
 	u32 sample_buffer;
+	u32 load_shadow;
+	u32 load_avg;
 
 	struct mutex isr_mutex;
-	struct mutex isr_enable_lock;
 	bool isr_enabled;
 
 	bool zbc_ready;
 	union {
 		struct pmu_cmdline_args_v0 args_v0;
 		struct pmu_cmdline_args_v1 args_v1;
+		struct pmu_cmdline_args_v2 args_v2;
+		struct pmu_cmdline_args_v3 args_v3;
+		struct pmu_cmdline_args_v4 args_v4;
 	};
+	unsigned long perfmon_events_cnt;
+	bool perfmon_sampling_enabled;
+	u8 pmu_mode; /*Added for GM20b, and ACR*/
+	u32 falcon_id;
+	u32 aelpg_param[5];
 };
 
 int gk20a_init_pmu_support(struct gk20a *g);
@@ -1082,9 +1291,33 @@ int pmu_mutex_acquire(struct pmu_gk20a *pmu, u32 id, u32 *token);
 int pmu_mutex_release(struct pmu_gk20a *pmu, u32 id, u32 *token);
 int gk20a_pmu_destroy(struct gk20a *g);
 int gk20a_pmu_load_norm(struct gk20a *g, u32 *load);
+int gk20a_pmu_load_update(struct gk20a *g);
 int gk20a_pmu_debugfs_init(struct platform_device *dev);
 void gk20a_pmu_reset_load_counters(struct gk20a *g);
 void gk20a_pmu_get_load_counters(struct gk20a *g, u32 *busy_cycles,
 		u32 *total_cycles);
+void gk20a_init_pmu_ops(struct gpu_ops *gops);
 
+void pmu_copy_to_dmem(struct pmu_gk20a *pmu,
+		u32 dst, u8 *src, u32 size, u8 port);
+void pmu_copy_from_dmem(struct pmu_gk20a *pmu,
+		u32 src, u8 *dst, u32 size, u8 port);
+int pmu_reset(struct pmu_gk20a *pmu);
+int gk20a_init_pmu(struct pmu_gk20a *pmu);
+void pmu_dump_falcon_stats(struct pmu_gk20a *pmu);
+void gk20a_remove_pmu_support(struct pmu_gk20a *pmu);
+void pmu_setup_hw(struct work_struct *work);
+void pmu_seq_init(struct pmu_gk20a *pmu);
+
+int gk20a_init_pmu(struct pmu_gk20a *pmu);
+
+int gk20a_pmu_ap_send_command(struct gk20a *g,
+		union pmu_ap_cmd *p_ap_cmd, bool b_block);
+int gk20a_aelpg_init(struct gk20a *g);
+int gk20a_aelpg_init_and_enable(struct gk20a *g, u8 ctrl_id);
+void pmu_enable_irq(struct pmu_gk20a *pmu, bool enable);
+int pmu_wait_message_cond(struct pmu_gk20a *pmu, u32 timeout,
+				 u32 *var, u32 val);
+void pmu_handle_fecs_boot_acr_msg(struct gk20a *g, struct pmu_msg *msg,
+				void *param, u32 handle, u32 status);
 #endif /*__PMU_GK20A_H__*/

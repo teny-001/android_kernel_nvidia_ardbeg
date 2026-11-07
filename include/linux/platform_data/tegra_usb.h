@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2010 Google, Inc.
- * Copyright (c) 2010-2014, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2010-2015, NVIDIA CORPORATION.  All rights reserved.
  *
  * This software is licensed under the terms of the GNU General Public
  * License version 2, as published by the Free Software Foundation, and
@@ -41,33 +41,8 @@ enum tegra_usb_phy_interface {
 enum tegra_usb_id_detection {
 	TEGRA_USB_ID = 0,
 	TEGRA_USB_PMU_ID = 1,
-	TEGRA_USB_GPIO_ID = 2,
-	TEGRA_USB_VIRTUAL_ID = 3,
+	TEGRA_USB_VIRTUAL_ID = 2,
 };
-
-/**
- * Set the maximum voltage that can be supplied
- * over USB vbus that the board supports if we use
- * a quick charge 2 wall charger.
- * a low value means longer charge time
- * a too high value will blow up the board.
- * if not sure what board supports use 5V.
- * Allowed values:
- *	TEGRA_USB_QC2_5V
- *	TEGRA_USB_QC2_9V
- *	TEGRA_USB_QC2_12V
- *	TEGRA_USB_QC2_20V (probably not safe)
- *
- * specify the maximum current that the internal charger
- * can draw from an external wall charger
- */
-enum tegra_usb_qc2_voltage {
-	TEGRA_USB_QC2_5V = 0,
-	TEGRA_USB_QC2_9V = 1,
-	TEGRA_USB_QC2_12V = 2,
-	TEGRA_USB_QC2_20V = 3,
-};
-
 
 /**
  * configuration structure for setting up utmi phy
@@ -126,7 +101,6 @@ struct tegra_usb_phy_platform_ops {
  */
 struct tegra_usb_dev_mode_data {
 	int vbus_pmu_irq;
-	int vbus_gpio;
 	int dcp_current_limit_ma;
 	int qc2_current_limit_ma;
 	bool charging_supported;
@@ -138,12 +112,12 @@ struct tegra_usb_dev_mode_data {
  * defines structure for platform dependent host parameters
  */
 struct tegra_usb_host_mode_data {
-	int vbus_gpio;
 	bool hot_plug;
 	bool remote_wakeup_supported;
 	bool power_off_on_suspend;
 	bool turn_off_vbus_on_lp0;
 	bool support_y_cable;
+	bool skip_resume;
 };
 
 /**
@@ -154,12 +128,12 @@ struct tegra_usb_platform_data {
 	bool has_hostpc;
 	bool unaligned_dma_buf_supported;
 	bool support_pmu_vbus;
-	char *vbus_extcon_dev_name;
-	char *id_extcon_dev_name;
+	const char *vbus_extcon_dev_name;
+	const char *id_extcon_dev_name;
 	enum tegra_usb_id_detection id_det_type;
 	enum tegra_usb_phy_interface phy_intf;
 	enum tegra_usb_operation_mode op_mode;
-	enum tegra_usb_qc2_voltage qc2_voltage;
+	u32 qc2_voltage;
 
 	union {
 		struct tegra_usb_dev_mode_data dev;

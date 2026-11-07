@@ -2,7 +2,7 @@
  * EHCI-compliant USB host controller driver for NVIDIA Tegra SoCs
  *
  * Copyright (c) 2010 Google, Inc.
- * Copyright (c) 2009-2014 NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2009-2015 NVIDIA CORPORATION. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the
@@ -30,17 +30,25 @@
 
 #include <linux/usb/tegra_usb_phy.h>
 
-#include <mach/pm_domains.h>
+#include <linux/tegra_pm_domains.h>
 #include <linux/pm_qos.h>
 #include <linux/wakelock.h>
+#include <linux/irqchip/tegra.h>
 
 /* HACK! This needs to come from DT */
 #include "../../../arch/arm/mach-tegra/iomap.h"
+#include "../../../arch/arm/mach-tegra/board.h"
 
 #if 0
 #define EHCI_DBG(stuff...)	pr_info("ehci-tegra: " stuff)
 #else
 #define EHCI_DBG(stuff...)	do {} while (0)
+#endif
+
+#if defined(CONFIG_ARM64)
+#define UTMI1_PORT_OWNER_XUSB   0x1
+#define UTMI2_PORT_OWNER_XUSB   0x2
+#define HSIC1_PORT_OWNER_XUSB   0x4
 #endif
 
 static const char driver_name[] = "tegra-ehci";
@@ -72,6 +80,7 @@ struct tegra_ehci_hcd {
 	struct delayed_work boost_cpu_freq_work;
 	struct pm_qos_request boost_cpu_freq_req;
 #endif
+	bool is_skip_resume_enabled;
 };
 
 struct dma_align_buffer {
@@ -87,7 +96,7 @@ static struct usb_phy *get_usb_phy(struct tegra_usb_phy *x)
 
 static int tegra_ehci_port_speed(struct ehci_hcd *ehci)
 {
-	u32 hostpc = ehci_readl(ehci, &ehci->regs->hostpc);
+	u32 hostpc = ehci_readl(ehci, ehci->regs->hostpc);
 	enum usb_device_speed port_speed;
 
 	switch ((hostpc >> (ehci->has_hostpc ? 25 : 26)) & 3) {
@@ -206,9 +215,10 @@ static void tegra_ehci_boost_cpu_frequency_work(struct work_struct *work)
 		struct tegra_ehci_hcd, boost_cpu_freq_work.work);
 	if (tegra->cpu_boost_in_work) {
 		tegra->boost_requested = true;
-		if (tegra->boost_enable && (tegra_ehci_port_speed(tegra->ehci)
-					== USB_SPEED_HIGH))
-			pm_qos_update_request(&tegra->boost_cpu_freq_req,
+		if (tegra->boost_enable &&
+			(tegra_ehci_port_speed(tegra->ehci) == USB_SPEED_HIGH))
+			pm_qos_update_request(
+				&tegra->boost_cpu_freq_req,
 				(s32)CONFIG_TEGRA_EHCI_BOOST_CPU_FREQ * 1000);
 	}
 }
@@ -228,7 +238,10 @@ static irqreturn_t tegra_ehci_irq(struct usb_hcd *hcd)
 	}
 	if (tegra_usb_phy_pmc_wakeup(tegra->phy)) {
 		ehci_dbg(ehci, "pmc interrupt detected\n");
-		wake_lock_timeout(&tegra->ehci_wake_lock, HZ);
+		if (tegra->is_skip_resume_enabled) {
+			wake_lock(&tegra->ehci_wake_lock);
+			hcd_to_bus(hcd)->skip_resume = false;
+		}
 		usb_hcd_resume_root_hub(hcd);
 		spin_unlock(&ehci->lock);
 		return irq_status;
@@ -366,9 +379,7 @@ static int tegra_ehci_setup(struct usb_hcd *hcd)
 	struct ehci_hcd *ehci = hcd_to_ehci(hcd);
 	struct tegra_ehci_hcd *tegra = dev_get_drvdata(hcd->self.controller);
 	int retval;
-#ifndef CONFIG_ARCH_TEGRA_2x_SOC
 	u32 val;
-#endif
 
 	/* EHCI registers start at offset 0x100 */
 	ehci->caps = hcd->regs + 0x100;
@@ -376,14 +387,12 @@ static int tegra_ehci_setup(struct usb_hcd *hcd)
 	ehci->has_hostpc = tegra->has_hostpc;
 	ehci->broken_hostpc_phcd = true;
 
-#ifndef CONFIG_ARCH_TEGRA_2x_SOC
 	ehci->has_hostpc = 1;
 
 	val = readl(hcd->regs + HOSTPC_REG_OFFSET);
 	val &= ~HOSTPC1_DEVLC_STS;
 	val &= ~HOSTPC1_DEVLC_NYT_ASUS;
 	writel(val, hcd->regs + HOSTPC_REG_OFFSET);
-#endif
 	/* switch to host mode */
 	hcd->has_tt = 1;
 
@@ -394,13 +403,11 @@ static int tegra_ehci_setup(struct usb_hcd *hcd)
 	ehci->controller_remote_wakeup = false;
 	tegra_usb_phy_reset(tegra->phy);
 
-#if !defined(CONFIG_ARCH_TEGRA_2x_SOC)
 	if (tegra_platform_is_fpga()) {
 		val =  readl(hcd->regs + TEGRA_STREAM_DISABLE);
 		val |= TEGRA_STREAM_DISABLE_OFFSET;
 		writel(val , hcd->regs + TEGRA_STREAM_DISABLE);
 	}
-#endif
 
 	return 0;
 }
@@ -427,8 +434,14 @@ static int tegra_ehci_bus_suspend(struct usb_hcd *hcd)
 	err = ehci_bus_suspend(hcd);
 	if (err)
 		tegra->bus_suspended_fail = true;
-	else
+	else {
 		usb_phy_set_suspend(get_usb_phy(tegra->phy), 1);
+		if (tegra->is_skip_resume_enabled) {
+			hcd_to_bus(hcd)->skip_resume = true;
+			wake_unlock(&tegra->ehci_wake_lock);
+		}
+	}
+	pm_runtime_put_sync(hcd->self.controller);
 	mutex_unlock(&tegra->sync_lock);
 	EHCI_DBG("%s() END\n", __func__);
 
@@ -441,22 +454,25 @@ static int tegra_ehci_bus_resume(struct usb_hcd *hcd)
 	int err = 0;
 	EHCI_DBG("%s() BEGIN\n", __func__);
 
-#ifdef CONFIG_TEGRA_EHCI_BOOST_CPU_FREQ
-	tegra->boost_requested = true;
-	if (pm_qos_request_active(&tegra->boost_cpu_freq_req)
-		&& tegra->boost_enable) {
-		schedule_delayed_work(&tegra->boost_cpu_freq_work, 4000);
-		tegra->cpu_boost_in_work = true;
-	}
-
-#endif
-
 	mutex_lock(&tegra->sync_lock);
+	if (tegra->is_skip_resume_enabled)
+		wake_lock(&tegra->ehci_wake_lock);
+
+	pm_runtime_get_sync(hcd->self.controller);
 	usb_phy_set_suspend(get_usb_phy(tegra->phy), 0);
 	err = ehci_bus_resume(hcd);
 	mutex_unlock(&tegra->sync_lock);
-	EHCI_DBG("%s() END\n", __func__);
 
+#ifdef CONFIG_TEGRA_EHCI_BOOST_CPU_FREQ
+	tegra->boost_requested = true;
+	if (pm_qos_request_active(&tegra->boost_cpu_freq_req)
+	    && tegra->boost_enable
+	    && (tegra_ehci_port_speed(tegra->ehci) == USB_SPEED_HIGH))
+		pm_qos_update_request(&tegra->boost_cpu_freq_req,
+			(s32)CONFIG_TEGRA_EHCI_BOOST_CPU_FREQ * 1000);
+	tegra->cpu_boost_in_work = false;
+#endif
+	EHCI_DBG("%s() END\n", __func__);
 	return err;
 }
 #endif
@@ -533,6 +549,154 @@ static DEVICE_ATTR(boost_enable, 0644,
 		   show_boost_enable, store_boost_enable);
 #endif
 
+static struct tegra_usb_platform_data *tegra_ehci_dt_parse_pdata(
+		struct platform_device *pdev)
+{
+	struct tegra_usb_platform_data *pdata;
+	struct device_node *np = pdev->dev.of_node;
+	u32 val;
+	bool is_intf_utmi, is_intf_hsic;
+	int err;
+	u32 instance;
+#if defined(CONFIG_ARCH_TEGRA_13x_SOC)
+	int modem_id = tegra_get_modem_id();
+	int usb_port_owner_info = tegra_get_usb_port_owner_info();
+#endif
+
+	if (!np)
+		return NULL;
+
+	pdata = devm_kzalloc(&pdev->dev, sizeof(struct tegra_usb_platform_data),
+			GFP_KERNEL);
+	if (!pdata) {
+		dev_err(&pdev->dev, "Can't allocate platform data\n");
+		return ERR_PTR(-ENOMEM);
+	}
+
+	pdata->op_mode = TEGRA_USB_OPMODE_HOST;
+	pdata->port_otg = of_property_read_bool(np, "nvidia,port-otg");
+	pdata->has_hostpc = of_property_read_bool(np, "nvidia,has-hostpc");
+	pdata->unaligned_dma_buf_supported =
+		of_property_read_bool(np, "nvidia,unaligned-dma-buf-supported");
+
+	is_intf_utmi = of_property_read_bool(np, "nvidia,is-intf-utmi");
+	if (is_intf_utmi)
+		pdata->phy_intf = TEGRA_USB_PHY_INTF_UTMI;
+
+	is_intf_hsic = of_property_read_bool(np, "nvidia,is-intf-hsic");
+	if (is_intf_hsic)
+		pdata->phy_intf = TEGRA_USB_PHY_INTF_HSIC;
+
+	/* If both the interfaces are selected,
+	 * DT contains wrong information */
+	BUG_ON(is_intf_hsic && is_intf_utmi);
+
+	instance = of_alias_get_id(pdev->dev.of_node, "ehci");
+#if defined(CONFIG_ARCH_TEGRA_21x_SOC)
+	if (instance == 1) {
+		pdata->phy_intf = TEGRA_USB_PHY_INTF_HSIC;
+		pdata->u_data.host.skip_resume =
+			of_property_read_bool(np, "nvidia,skip_resume");
+		tegra_set_wake_source(42, INT_USB2);
+	}
+#elif defined(CONFIG_ARCH_TEGRA_13x_SOC)
+	if (instance == 1 && modem_id) {
+		if (!(usb_port_owner_info & HSIC1_PORT_OWNER_XUSB)) {
+			pdata->phy_intf = TEGRA_USB_PHY_INTF_HSIC;
+			tegra_set_wake_source(42, INT_USB2);
+		} else
+			return NULL;
+	} else if (is_intf_utmi) {
+		if (!(usb_port_owner_info &
+			(UTMI1_PORT_OWNER_XUSB ||
+			UTMI2_PORT_OWNER_XUSB)))
+			pdata->phy_intf = TEGRA_USB_PHY_INTF_UTMI;
+		else
+			return NULL;
+	}
+#endif
+	pdata->op_mode = TEGRA_USB_OPMODE_HOST;
+
+	pdata->u_data.host.hot_plug =
+		of_property_read_bool(np, "nvidia,hot-plug");
+	pdata->u_data.host.remote_wakeup_supported =
+		of_property_read_bool(np, "nvidia,remote-wakeup-supported");
+
+	pdata->u_data.host.power_off_on_suspend = of_property_read_bool(np,
+			"nvidia,power-off-on-suspend");
+
+	pdata->u_data.host.turn_off_vbus_on_lp0 =  of_property_read_bool(np,
+			"nvidia,turn-off-vbus-on-lp0");
+
+	val = 0;
+	if (pdata->phy_intf == TEGRA_USB_PHY_INTF_UTMI) {
+		err = of_property_read_u32(np,
+					"nvidia,hssync-start-delay", &val);
+		if (!err)
+			pdata->u_cfg.utmi.hssync_start_delay = val;
+
+		err = of_property_read_u32(np,
+			"nvidia,idle-wait-delay", &val);
+		if (!err)
+			pdata->u_cfg.utmi.idle_wait_delay = val;
+
+		err = of_property_read_u32(np, "nvidia,elastic-limit", &val);
+		if (!err)
+			pdata->u_cfg.utmi.elastic_limit = val;
+
+		err = of_property_read_u32(np,
+					"nvidia,term-range-adj", &val);
+		if (!err)
+			pdata->u_cfg.utmi.term_range_adj = val;
+
+		err = of_property_read_u32(np, "nvidia,xcvr-setup", &val);
+		if (!err)
+			pdata->u_cfg.utmi.xcvr_setup = val;
+
+		err = of_property_read_u32(np, "nvidia,xcvr-lsfslew", &val);
+		if (!err)
+			pdata->u_cfg.utmi.xcvr_lsfslew = val;
+
+		err = of_property_read_u32(np, "nvidia,xcvr-lsrslew", &val);
+		if (!err)
+			pdata->u_cfg.utmi.xcvr_lsrslew = val;
+
+		err = of_property_read_u32(np,
+					"nvidia,xcvr-setup-offset", &val);
+		if (!err)
+			pdata->u_cfg.utmi.xcvr_setup_offset = val;
+
+		err = of_property_read_u32(np, "nvidia,xcvr-use-lsb", &val);
+		if (!err)
+			pdata->u_cfg.utmi.xcvr_use_lsb = val;
+
+		pdata->u_cfg.utmi.xcvr_use_fuses =
+			of_property_read_bool(np, "nvidia,xcvr-use-fuses");
+
+		err = of_property_read_u32(np, "nvidia,vbus-oc-map", &val);
+		if (!err)
+			pdata->u_cfg.utmi.vbus_oc_map = val;
+
+		err = of_property_read_u32(np,
+				"nvidia,xcvr-hsslew-lsb", &val);
+		if (!err)
+			pdata->u_cfg.utmi.xcvr_hsslew_lsb = val;
+
+		err = of_property_read_u32(np,
+				"nvidia,xcvr-hsslew-msb", &val);
+		if (!err)
+			pdata->u_cfg.utmi.xcvr_hsslew_msb = val;
+	}
+
+	return pdata;
+}
+
+static const struct of_device_id tegra_ehci_dev_match[] = {
+	{ .compatible = "nvidia,tegra124-ehci", },
+	{ .compatible = "nvidia,tegra132-ehci", },
+	{ },
+};
+
 static int tegra_ehci_probe(struct platform_device *pdev)
 {
 	struct resource *res;
@@ -542,6 +706,7 @@ static int tegra_ehci_probe(struct platform_device *pdev)
 	int err = 0;
 	int irq;
 	int instance = pdev->id;
+	int ret;
 
 	/* Right now device-tree probed devices don't get dma_mask set.
 	 * Since shared usb code relies on it, set it here for now.
@@ -550,8 +715,21 @@ static int tegra_ehci_probe(struct platform_device *pdev)
 	if (!pdev->dev.dma_mask)
 		pdev->dev.dma_mask = &tegra_ehci_dma_mask;
 
-	pdata = dev_get_platdata(&pdev->dev);
+	pdata = pdev->dev.platform_data;
 
+	if (pdata == NULL) {
+		if (pdev->dev.of_node) {
+			pdata = tegra_ehci_dt_parse_pdata(pdev);
+			platform_device_add_data(pdev, pdata,
+				sizeof(struct tegra_usb_platform_data));
+		}
+	} else
+		pdata = dev_get_platdata(&pdev->dev);
+
+	if (!pdata) {
+		dev_err(&pdev->dev, "Platform data missing\n");
+		return -ENOMEM;
+	}
 	tegra = devm_kzalloc(&pdev->dev, sizeof(struct tegra_ehci_hcd),
 			     GFP_KERNEL);
 	if (!tegra) {
@@ -654,6 +832,13 @@ static int tegra_ehci_probe(struct platform_device *pdev)
 	}
 
 	tegra->ehci = hcd_to_ehci(hcd);
+	if (pdata->phy_intf == TEGRA_USB_PHY_INTF_HSIC) {
+		hcd_to_bus(hcd)->skip_resume = pdata->u_data.host.skip_resume;
+		tegra->is_skip_resume_enabled = pdata->u_data.host.skip_resume;
+	} else if (pdata->phy_intf == TEGRA_USB_PHY_INTF_UTMI) {
+		hcd_to_bus(hcd)->skip_resume = false;
+		tegra->is_skip_resume_enabled = false;
+	}
 
 	if (pdata->port_otg) {
 		tegra->transceiver =
@@ -662,8 +847,14 @@ static int tegra_ehci_probe(struct platform_device *pdev)
 			otg_set_host(tegra->transceiver->otg, &hcd->self);
 	}
 
+	ret = genpd_dev_pm_add(tegra_ehci_dev_match, &pdev->dev);
+	if (ret)
+		pr_err("Could not add %s to power domain using device tree\n",
+					  dev_name(&pdev->dev));
+
 	tegra_pd_add_device(&pdev->dev);
 	pm_runtime_enable(&pdev->dev);
+	pm_runtime_get_sync(&pdev->dev);
 
 #ifdef CONFIG_TEGRA_EHCI_BOOST_CPU_FREQ
 	INIT_DELAYED_WORK(&tegra->boost_cpu_freq_work,
@@ -698,6 +889,8 @@ static int tegra_ehci_resume(struct platform_device *pdev)
 	int err = 0;
 	struct tegra_ehci_hcd *tegra = platform_get_drvdata(pdev);
 	struct tegra_usb_platform_data *pdata = dev_get_platdata(&pdev->dev);
+	struct usb_hcd *hcd = ehci_to_hcd(tegra->ehci);
+
 	if (tegra->irq) {
 		err = disable_irq_wake(tegra->irq);
 		if (err < 0)
@@ -705,29 +898,42 @@ static int tegra_ehci_resume(struct platform_device *pdev)
 				"Couldn't disable USB host mode wakeup, irq=%d, "
 				"error=%d\n", tegra->irq, err);
 	}
+
+	if (tegra->is_skip_resume_enabled) {
+		if (tegra_usb_phy_is_pmc_wake(tegra->phy))
+			hcd_to_bus(hcd)->skip_resume = false;
+	}
+
 	if (pdata->u_data.host.turn_off_vbus_on_lp0) {
 		tegra_usb_enable_vbus(tegra->phy, true);
-		tegra_ehci_notify_event(tegra, USB_EVENT_ID);
+		if (pdata->port_otg)
+			tegra_ehci_notify_event(tegra, USB_EVENT_ID);
 	}
-	return tegra_usb_phy_power_on(tegra->phy);
+	if (tegra->is_skip_resume_enabled)
+		return 0;
+	else
+		return tegra_usb_phy_power_on(tegra->phy);
+
 }
 
 static int tegra_ehci_suspend(struct platform_device *pdev, pm_message_t state)
 {
 	struct tegra_ehci_hcd *tegra = platform_get_drvdata(pdev);
 	struct tegra_usb_platform_data *pdata = dev_get_platdata(&pdev->dev);
-	int err;
+	int err = -EBUSY;
 
 	/* bus suspend could have failed because of remote wakeup resume */
 	if (tegra->bus_suspended_fail)
-		return -EBUSY;
+		return err;
 	else {
-		err = tegra_usb_phy_power_off(tegra->phy);
-		if (err < 0)
-			return err;
-		if (pdata->u_data.host.turn_off_vbus_on_lp0) {
-			tegra_usb_enable_vbus(tegra->phy, false);
-			tegra_usb_phy_pmc_disable(tegra->phy);
+		if (!tegra->is_skip_resume_enabled) {
+			err = tegra_usb_phy_power_off(tegra->phy);
+			if (err < 0)
+				return err;
+			if (pdata->u_data.host.turn_off_vbus_on_lp0) {
+				tegra_usb_enable_vbus(tegra->phy, false);
+				tegra_usb_phy_pmc_disable(tegra->phy);
+			}
 		}
 		if (tegra->irq) {
 			err = enable_irq_wake(tegra->irq);
@@ -790,6 +996,7 @@ static int tegra_ehci_remove(struct platform_device *pdev)
 	mutex_destroy(&tegra->sync_lock);
 	tegra_pd_remove_device(&pdev->dev);
 
+	pm_runtime_disable(&pdev->dev);
 	return 0;
 }
 
@@ -804,6 +1011,8 @@ static void tegra_ehci_hcd_shutdown(struct platform_device *pdev)
 
 static struct of_device_id tegra_ehci_of_match[] = {
 	{ .compatible = "nvidia,tegra20-ehci", },
+	{ .compatible = "nvidia,tegra132-ehci", },
+	{ .compatible = "nvidia,tegra124-ehci", },
 	{ },
 };
 

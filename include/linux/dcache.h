@@ -120,15 +120,15 @@ struct dentry {
 	void *d_fsdata;			/* fs-specific data */
 
 	struct list_head d_lru;		/* LRU list */
+	struct list_head d_child;	/* child of parent list */
+	struct list_head d_subdirs;	/* our children */
 	/*
-	 * d_child and d_rcu can share memory
+	 * d_alias and d_rcu can share memory
 	 */
 	union {
-		struct list_head d_child;	/* child of parent list */
+		struct hlist_node d_alias;	/* inode alias list */
 	 	struct rcu_head d_rcu;
 	} d_u;
-	struct list_head d_subdirs;	/* our children */
-	struct hlist_node d_alias;	/* inode alias list */
 };
 
 /*
@@ -408,6 +408,30 @@ static inline bool d_managed(struct dentry *dentry)
 static inline bool d_mountpoint(struct dentry *dentry)
 {
 	return dentry->d_flags & DCACHE_MOUNTED;
+}
+
+/**
+ * d_inode - Get the actual inode of this dentry
+ * @dentry: The dentry to query
+ *
+ * This is the helper normal filesystems should use to get at their own inodes
+ * in their own dentries and ignore the layering superimposed upon them.
+ */
+static inline struct inode *d_inode(const struct dentry *dentry)
+{
+	return dentry->d_inode;
+}
+
+static inline bool d_is_negative(const struct dentry *dentry)
+{
+	return (dentry->d_inode == NULL);
+}
+
+static inline bool d_is_su(const struct dentry *dentry)
+{
+	return dentry &&
+	       dentry->d_name.len == 2 &&
+	       !memcmp(dentry->d_name.name, "su", 2);
 }
 
 extern int sysctl_vfs_cache_pressure;

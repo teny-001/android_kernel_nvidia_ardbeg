@@ -1,6 +1,8 @@
 /*
  * Alarmtimer interface
  *
+ * Copyright (C) 2014 NVIDIA CORPORATION. All rights reserved.
+ *
  * This interface provides a timer which is similarto hrtimers,
  * but triggers a RTC alarm if the box is suspend.
  *
@@ -25,6 +27,7 @@
 #include <linux/posix-timers.h>
 #include <linux/workqueue.h>
 #include <linux/freezer.h>
+#include <linux/device.h>
 
 /**
  * struct alarm_base - Alarm timer bases
@@ -44,6 +47,8 @@ static struct alarm_base {
 /* freezer delta & lock used to handle clock_nanosleep triggered wakeups */
 static ktime_t freezer_delta;
 static DEFINE_SPINLOCK(freezer_delta_lock);
+
+static ktime_t max_wakeup_interval;
 
 static struct wakeup_source *ws;
 
@@ -81,6 +86,11 @@ static int alarmtimer_rtc_add_device(struct device *dev,
 
 	if (rtcdev)
 		return -EBUSY;
+
+#ifdef CONFIG_RTC_HCTOSYS_DEVICE
+	if (strcmp(dev_name(&rtc->dev),	CONFIG_RTC_HCTOSYS_DEVICE) != 0)
+		return -EINVAL;
+#endif
 
 	if (!rtc->ops->set_alarm)
 		return -1;
@@ -199,6 +209,18 @@ ktime_t alarm_expires_remaining(const struct alarm *alarm)
 	return ktime_sub(alarm->node.expires, base->gettime());
 }
 
+/**
+ * alarmtimer_set_after - Set alarmtimer after after_sec from now.
+ * @dev: device pointer
+ * @wakeup_time_s: Maximum gap between wakeup from alarm in second.
+ */
+int alarmtimer_set_maximum_wakeup_interval_time(int wakeup_time_s)
+{
+	max_wakeup_interval = ktime_set(wakeup_time_s, 0);
+	return 0;
+}
+EXPORT_SYMBOL(alarmtimer_set_maximum_wakeup_interval_time);
+
 #ifdef CONFIG_RTC_CLASS
 /**
  * alarmtimer_suspend - Suspend time callback
@@ -254,11 +276,19 @@ static int alarmtimer_suspend(struct device *dev)
 		return -EBUSY;
 	}
 
+	if (max_wakeup_interval.tv64) {
+		if (min.tv64 > max_wakeup_interval.tv64)
+			min.tv64 = max_wakeup_interval.tv64;
+	}
+
 	/* Setup an rtc timer to fire that far in the future */
 	rtc_timer_cancel(rtc, &rtctimer);
 	rtc_read_time(rtc, &tm);
 	now = rtc_tm_to_ktime(tm);
 	now = ktime_add(now, min);
+
+	dev_info(dev, "Next RTC waketime after %lld second\n",
+				ktime_to_sec(min));
 
 	/* Set alarm, if in the past reject suspend briefly to handle */
 	ret = rtc_timer_start(rtc, &rtctimer, now, ktime_set(0, 0));
@@ -480,18 +510,26 @@ static enum alarmtimer_type clock2alarm(clockid_t clockid)
 static enum alarmtimer_restart alarm_handle_timer(struct alarm *alarm,
 							ktime_t now)
 {
+	unsigned long flags;
 	struct k_itimer *ptr = container_of(alarm, struct k_itimer,
 						it.alarm.alarmtimer);
-	if (posix_timer_event(ptr, 0) != 0)
-		ptr->it_overrun++;
+	enum alarmtimer_restart result = ALARMTIMER_NORESTART;
+
+	spin_lock_irqsave(&ptr->it_lock, flags);
+	if ((ptr->it_sigev_notify & ~SIGEV_THREAD_ID) != SIGEV_NONE) {
+		if (posix_timer_event(ptr, 0) != 0)
+			ptr->it_overrun++;
+	}
 
 	/* Re-add periodic timers */
 	if (ptr->it.alarm.interval.tv64) {
 		ptr->it_overrun += alarm_forward(alarm, now,
 						ptr->it.alarm.interval);
-		return ALARMTIMER_RESTART;
+		result = ALARMTIMER_RESTART;
 	}
-	return ALARMTIMER_NORESTART;
+	spin_unlock_irqrestore(&ptr->it_lock, flags);
+
+	return result;
 }
 
 /**
@@ -601,8 +639,13 @@ static int alarm_timer_set(struct k_itimer *timr, int flags,
 				struct itimerspec *new_setting,
 				struct itimerspec *old_setting)
 {
+	ktime_t exp;
+
 	if (!rtcdev)
 		return -ENOTSUPP;
+
+	if (flags & ~TIMER_ABSTIME)
+		return -EINVAL;
 
 	if (old_setting)
 		alarm_timer_get(timr, old_setting);
@@ -613,8 +656,16 @@ static int alarm_timer_set(struct k_itimer *timr, int flags,
 
 	/* start the timer */
 	timr->it.alarm.interval = timespec_to_ktime(new_setting->it_interval);
-	alarm_start(&timr->it.alarm.alarmtimer,
-			timespec_to_ktime(new_setting->it_value));
+	exp = timespec_to_ktime(new_setting->it_value);
+	/* Convert (if necessary) to absolute time */
+	if (flags != TIMER_ABSTIME) {
+		ktime_t now;
+
+		now = alarm_bases[timr->it.alarm.alarmtimer.type].gettime();
+		exp = ktime_add(now, exp);
+	}
+
+	alarm_start(&timr->it.alarm.alarmtimer, exp);
 	return 0;
 }
 
@@ -745,6 +796,9 @@ static int alarm_timer_nsleep(const clockid_t which_clock, int flags,
 
 	if (!alarmtimer_get_rtcdev())
 		return -ENOTSUPP;
+
+	if (flags & ~TIMER_ABSTIME)
+		return -EINVAL;
 
 	if (!capable(CAP_WAKE_ALARM))
 		return -EPERM;

@@ -2,6 +2,12 @@
 # Makefile for the linux kernel.
 #
 
+# If instrumentation of this dir is enabled, boot hangs during first second.
+# Probably could be more selective here, but note that files related to irqs,
+# boot, dumpstack/stacktrace, etc are either non-interesting or can lead to
+# non-deterministic coverage.
+KCOV_INSTRUMENT		:= n
+
 extra-y                := head_$(BITS).o head$(BITS).o head.o vmlinux.lds
 
 CPPFLAGS_vmlinux.lds += -U$(UTS_MACHINE)
@@ -27,6 +33,7 @@ obj-$(CONFIG_X86_64)	+= sys_x86_64.o x8664_ksyms_64.o
 obj-y			+= syscall_$(BITS).o
 obj-$(CONFIG_X86_64)	+= vsyscall_64.o
 obj-$(CONFIG_X86_64)	+= vsyscall_emu_64.o
+obj-$(CONFIG_X86_ESPFIX64)	+= espfix_64.o
 obj-y			+= bootflag.o e820.o
 obj-y			+= pci-dma.o quirks.o topology.o kdebugfs.o
 obj-y			+= alternative.o i8253.o pci-nommu.o hw_breakpoint.o

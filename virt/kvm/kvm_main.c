@@ -52,6 +52,7 @@
 
 #include <asm/processor.h>
 #include <asm/io.h>
+#include <asm/ioctl.h>
 #include <asm/uaccess.h>
 #include <asm/pgtable.h>
 
@@ -105,12 +106,12 @@ bool kvm_is_mmio_pfn(pfn_t pfn)
 	if (pfn_valid(pfn)) {
 		int reserved;
 		struct page *tail = pfn_to_page(pfn);
-		struct page *head = compound_trans_head(tail);
+		struct page *head = compound_head(tail);
 		reserved = PageReserved(head);
 		if (head != tail) {
 			/*
 			 * "head" is not a dangling pointer
-			 * (compound_trans_head takes care of that)
+			 * (compound_head takes care of that)
 			 * but the hugepage may have been splitted
 			 * from under us (and we may not hold a
 			 * reference count on the head page so it can
@@ -273,8 +274,9 @@ static inline struct kvm *mmu_notifier_to_kvm(struct mmu_notifier *mn)
 }
 
 static void kvm_mmu_notifier_invalidate_page(struct mmu_notifier *mn,
-					     struct mm_struct *mm,
-					     unsigned long address)
+					     struct vm_area_struct *vma,
+					     unsigned long address,
+					     enum mmu_event event)
 {
 	struct kvm *kvm = mmu_notifier_to_kvm(mn);
 	int need_tlb_flush, idx;
@@ -313,7 +315,8 @@ static void kvm_mmu_notifier_invalidate_page(struct mmu_notifier *mn,
 static void kvm_mmu_notifier_change_pte(struct mmu_notifier *mn,
 					struct mm_struct *mm,
 					unsigned long address,
-					pte_t pte)
+					pte_t pte,
+					enum mmu_event event)
 {
 	struct kvm *kvm = mmu_notifier_to_kvm(mn);
 	int idx;
@@ -327,9 +330,10 @@ static void kvm_mmu_notifier_change_pte(struct mmu_notifier *mn,
 }
 
 static void kvm_mmu_notifier_invalidate_range_start(struct mmu_notifier *mn,
-						    struct mm_struct *mm,
+						    struct vm_area_struct *vma,
 						    unsigned long start,
-						    unsigned long end)
+						    unsigned long end,
+						    enum mmu_event event)
 {
 	struct kvm *kvm = mmu_notifier_to_kvm(mn);
 	int need_tlb_flush = 0, idx;
@@ -353,9 +357,10 @@ static void kvm_mmu_notifier_invalidate_range_start(struct mmu_notifier *mn,
 }
 
 static void kvm_mmu_notifier_invalidate_range_end(struct mmu_notifier *mn,
-						  struct mm_struct *mm,
+						  struct vm_area_struct *vma,
 						  unsigned long start,
-						  unsigned long end)
+						  unsigned long end,
+						  enum mmu_event event)
 {
 	struct kvm *kvm = mmu_notifier_to_kvm(mn);
 
@@ -1548,8 +1553,8 @@ int kvm_gfn_to_hva_cache_init(struct kvm *kvm, struct gfn_to_hva_cache *ghc,
 	ghc->generation = slots->generation;
 	ghc->len = len;
 	ghc->memslot = gfn_to_memslot(kvm, start_gfn);
-	ghc->hva = gfn_to_hva_many(ghc->memslot, start_gfn, &nr_pages_avail);
-	if (!kvm_is_error_hva(ghc->hva) && nr_pages_avail >= nr_pages_needed) {
+	ghc->hva = gfn_to_hva_many(ghc->memslot, start_gfn, NULL);
+	if (!kvm_is_error_hva(ghc->hva) && nr_pages_needed <= 1) {
 		ghc->hva += offset;
 	} else {
 		/*
@@ -1980,6 +1985,9 @@ static long kvm_vcpu_ioctl(struct file *filp,
 
 	if (vcpu->kvm->mm != current->mm)
 		return -EIO;
+
+	if (unlikely(_IOC_TYPE(ioctl) != KVMIO))
+		return -EINVAL;
 
 #if defined(CONFIG_S390) || defined(CONFIG_PPC) || defined(CONFIG_MIPS)
 	/*

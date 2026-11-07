@@ -182,6 +182,11 @@ static int sleep_on_page(void *word)
 	return 0;
 }
 
+static int sleep_on_page_timeout(void *word)
+{
+	return io_schedule_timeout(2) ? 0 : -EAGAIN;
+}
+
 static int sleep_on_page_killable(void *word)
 {
 	sleep_on_page(word);
@@ -562,6 +567,16 @@ void wait_on_page_bit(struct page *page, int bit_nr)
 }
 EXPORT_SYMBOL(wait_on_page_bit);
 
+void wait_on_page_bit_timeout(struct page *page, int bit_nr)
+{
+	DEFINE_WAIT_BIT(wait, &page->flags, bit_nr);
+
+	if (test_bit(bit_nr, &page->flags))
+		__wait_on_bit(page_waitqueue(page), &wait,
+				sleep_on_page_timeout, TASK_UNINTERRUPTIBLE);
+}
+EXPORT_SYMBOL(wait_on_page_bit_timeout);
+
 int wait_on_page_bit_killable(struct page *page, int bit_nr)
 {
 	DEFINE_WAIT_BIT(wait, &page->flags, bit_nr);
@@ -691,7 +706,8 @@ int __lock_page_or_retry(struct page *page, struct mm_struct *mm,
  * Is there a pagecache struct page at the given (mapping, offset) tuple?
  * If yes, increment its refcount and return it; if no, return NULL.
  */
-struct page *find_get_page(struct address_space *mapping, pgoff_t offset)
+struct page *find_get_page_flags(struct address_space *mapping, pgoff_t offset,
+				 int fgp_flags)
 {
 	void **pagep;
 	struct page *page;
@@ -728,6 +744,8 @@ repeat:
 		}
 	}
 out:
+	if (page && (fgp_flags & FGP_ACCESSED))
+		mark_page_accessed(page);
 	rcu_read_unlock();
 
 	return page;
@@ -1635,14 +1653,14 @@ int filemap_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 		 * We found the page, so try async readahead before
 		 * waiting for the lock.
 		 */
-		memcg_oom = mem_cgroup_toggle_oom(false);
+		mem_cgroup_oom_disable();
 		do_async_mmap_readahead(vma, ra, file, page, offset);
-		mem_cgroup_toggle_oom(memcg_oom);
+		mem_cgroup_oom_enable();
 	} else if (!page) {
 		/* No page in the page cache at all */
-		memcg_oom = mem_cgroup_toggle_oom(false);
+		mem_cgroup_oom_disable();
 		do_sync_mmap_readahead(vma, ra, file, offset);
-		mem_cgroup_toggle_oom(memcg_oom);
+		mem_cgroup_oom_enable();
 		count_vm_event(PGMAJFAULT);
 		mem_cgroup_count_vm_event(vma->vm_mm, PGMAJFAULT);
 		ret = VM_FAULT_MAJOR;
@@ -2349,6 +2367,11 @@ again:
 			break;
 		}
 
+		if (fatal_signal_pending(current)) {
+			status = -EINTR;
+			break;
+		}
+
 		status = a_ops->write_begin(file, mapping, pos, bytes, flags,
 						&page, &fsdata);
 		if (unlikely(status))
@@ -2389,10 +2412,6 @@ again:
 		written += copied;
 
 		balance_dirty_pages_ratelimited(mapping);
-		if (fatal_signal_pending(current)) {
-			status = -EINTR;
-			break;
-		}
 	} while (iov_iter_count(i));
 
 	return written ? written : status;
